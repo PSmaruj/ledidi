@@ -193,8 +193,14 @@ class Ledidi(torch.nn.Module):
             may contain one or more edits compared to the sequence that was
             passed in.
         """
-
-        logits = torch.log(X + self.eps) + self.weights
+        
+        # Reshape expanded_weights to match the size [1, 4, 32768] for addition
+        expanded_weights_squeezed = self.weights.squeeze(0)  # Removing the second dimension
+        expanded_weights_squeezed = expanded_weights_squeezed.permute(0, 2, 1)
+        
+        logits = torch.log(X + self.eps) + expanded_weights_squeezed
+        
+        # logits = torch.log(X + self.eps) + self.weights
         logits = logits.expand(self.batch_size, *(-1 for i in range(X.ndim-1)))
         return torch.nn.functional.gumbel_softmax(logits, tau=self.tau, 
             hard=True, dim=1)
@@ -242,19 +248,19 @@ class Ledidi(torch.nn.Module):
             self.weights.requires_grad = True
         
         inpainting_mask = X[0].sum(dim=0) == 1
-        y_hat = self.model(X)[:, self.target]
+        y_hat = self.model(X)[:, self.target].squeeze(0)
+        
+        X_ = X.expand(self.batch_size, *X.shape[1:])
+        y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
         
         n_iter_wo_improvement = 0
         output_loss = self.output_loss(y_hat, y_bar).item()
-
+        
         best_input_loss = 0.0
         best_output_loss = output_loss
         best_total_loss = output_loss
         best_sequence = X
         best_weights = torch.clone(self.weights)
-        
-        X_ = X.expand(self.batch_size, *X.shape[1:])
-        y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
         
         tic = time.time()
         initial_tic = time.time()
@@ -267,11 +273,16 @@ class Ledidi(torch.nn.Module):
             X_hat = self(X)
             y_hat = self.model(X_hat)[:, self.target]
             
+            # change from [1,1,length] to [1,length]
+            y_hat = y_hat.squeeze(0)
+            
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
             output_loss = self.output_loss(y_hat, y_bar)
-            total_loss = output_loss + self.l * input_loss
-
-            optimizer.zero_grad()
+            # total_loss = output_loss + self.l * input_loss
+            output_loss = output_loss.float()
+            total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
+            
+            optimizer.zero_grad()          
             total_loss.backward()
             optimizer.step()
 
@@ -292,7 +303,9 @@ class Ledidi(torch.nn.Module):
                 history['output_loss'].append(output_loss)
                 history['total_loss'].append(total_loss)
 
-            if total_loss < best_total_loss:
+            # if total_loss < best_total_loss:
+            # if total_loss < 85.0:
+            if total_loss < 0.25:
                 best_input_loss = input_loss
                 best_output_loss = output_loss
                 best_total_loss = total_loss
