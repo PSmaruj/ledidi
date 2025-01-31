@@ -135,7 +135,7 @@ class Ledidi(torch.nn.Module):
         reduction='sum'), output_loss=torch.nn.MSELoss(), tau=1, l=0.1, 
         batch_size=16, max_iter=1000, early_stopping_iter=100, report_iter=100, 
         lr=1.0, input_mask=None, initial_weights=None, eps=1e-4, 
-        return_history=False, verbose=True):
+        return_history=False, verbose=True, seq_length=1048576):
         super().__init__()
         
         for param in model.parameters():
@@ -155,6 +155,7 @@ class Ledidi(torch.nn.Module):
         self.eps = eps
         self.return_history = return_history
         self.verbose = verbose
+        self.seq_length = seq_length
 
         if target is None:
             self.target = slice(target)
@@ -162,7 +163,7 @@ class Ledidi(torch.nn.Module):
             self.target = slice(target, target+1)
 
         if initial_weights is None:
-            initial_weights = torch.zeros(1, *shape, dtype=torch.float32,
+            initial_weights = torch.zeros((1, 4, seq_length), dtype=torch.float32,
                 requires_grad=True)
         else:
             initial_weights.requires_grad = True
@@ -192,14 +193,7 @@ class Ledidi(torch.nn.Module):
             A tensor containing a batch of one-hot encoded sequences which
             may contain one or more edits compared to the sequence that was
             passed in.
-        """
-        
-        # Reshape expanded_weights to match the size [1, 4, 32768] for addition
-        # expanded_weights_squeezed = self.weights.squeeze(0)  # Removing the second dimension
-        # expanded_weights_squeezed = expanded_weights_squeezed.permute(0, 2, 1)
-        
-        # logits = torch.log(X + self.eps) + expanded_weights_squeezed
-        
+        """        
         logits = torch.log(X + self.eps) + self.weights
         logits = logits.expand(self.batch_size, *(-1 for i in range(X.ndim-1)))
         return torch.nn.functional.gumbel_softmax(logits, tau=self.tau, 
@@ -236,7 +230,7 @@ class Ledidi(torch.nn.Module):
             may contain one or more edits compared to the sequence that was
             passed in.
         """
-
+        
         optimizer = torch.optim.AdamW((self.weights,), lr=self.lr)
         history = {'edits': [], 'input_loss': [], 'output_loss': [], 
             'total_loss': [], 'batch_size': self.batch_size}
@@ -248,19 +242,19 @@ class Ledidi(torch.nn.Module):
             self.weights.requires_grad = True
         
         inpainting_mask = X[0].sum(dim=0) == 1
-        y_hat = self.model(X)[:, self.target].squeeze(0)
+        y_hat = self.model(X)[:, self.target]
         
-        X_ = X.expand(self.batch_size, *X.shape[1:])
-        y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
-        
-        n_iter_wo_improvement = 0
+        n_iter_wo_improvement = 0        
         output_loss = self.output_loss(y_hat, y_bar).item()
-        
+
         best_input_loss = 0.0
         best_output_loss = output_loss
         best_total_loss = output_loss
         best_sequence = X
         best_weights = torch.clone(self.weights)
+        
+        X_ = X.expand(self.batch_size, *X.shape[1:])
+        y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
         
         tic = time.time()
         initial_tic = time.time()
@@ -273,16 +267,16 @@ class Ledidi(torch.nn.Module):
             X_hat = self(X)
             y_hat = self.model(X_hat)[:, self.target]
             
-            # change from [1,1,length] to [1,length]
+            # # change from [1,1,length] to [1,length]
+            # needs to be uncomment, if there is only one target
             # y_hat = y_hat.squeeze(0)
             
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
             output_loss = self.output_loss(y_hat, y_bar)
-            # total_loss = output_loss + self.l * input_loss
-            output_loss = output_loss.float()
+            # output_loss = output_loss.float()
             total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
-            
-            optimizer.zero_grad()          
+
+            optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
 
@@ -304,7 +298,7 @@ class Ledidi(torch.nn.Module):
                 history['total_loss'].append(total_loss)
 
             if total_loss < best_total_loss:
-            # if total_loss < 85.0:
+            # if total_loss < 2.519e+04:
             # if total_loss < 0.25:
                 best_input_loss = input_loss
                 best_output_loss = output_loss
