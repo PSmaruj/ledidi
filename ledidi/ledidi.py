@@ -195,12 +195,12 @@ class Ledidi(torch.nn.Module):
         """
         
         # Reshape expanded_weights to match the size [1, 4, 32768] for addition
-        expanded_weights_squeezed = self.weights.squeeze(0)  # Removing the second dimension
-        expanded_weights_squeezed = expanded_weights_squeezed.permute(0, 2, 1)
+        # expanded_weights_squeezed = self.weights.squeeze(0)  # Removing the second dimension
+        # expanded_weights_squeezed = expanded_weights_squeezed.permute(0, 2, 1)
         
-        logits = torch.log(X + self.eps) + expanded_weights_squeezed
+        # logits = torch.log(X + self.eps) + expanded_weights_squeezed
         
-        # logits = torch.log(X + self.eps) + self.weights
+        logits = torch.log(X + self.eps) + self.weights
         logits = logits.expand(self.batch_size, *(-1 for i in range(X.ndim-1)))
         return torch.nn.functional.gumbel_softmax(logits, tau=self.tau, 
             hard=True, dim=1)
@@ -274,7 +274,7 @@ class Ledidi(torch.nn.Module):
             y_hat = self.model(X_hat)[:, self.target]
             
             # change from [1,1,length] to [1,length]
-            y_hat = y_hat.squeeze(0)
+            # y_hat = y_hat.squeeze(0)
             
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
             output_loss = self.output_loss(y_hat, y_bar)
@@ -303,9 +303,9 @@ class Ledidi(torch.nn.Module):
                 history['output_loss'].append(output_loss)
                 history['total_loss'].append(total_loss)
 
-            # if total_loss < best_total_loss:
+            if total_loss < best_total_loss:
             # if total_loss < 85.0:
-            if total_loss < 0.25:
+            # if total_loss < 0.25:
                 best_input_loss = input_loss
                 best_output_loss = output_loss
                 best_total_loss = total_loss
