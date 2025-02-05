@@ -135,7 +135,7 @@ class Ledidi(torch.nn.Module):
         reduction='sum'), output_loss=torch.nn.MSELoss(), tau=1, l=0.1, 
         batch_size=16, max_iter=1000, early_stopping_iter=100, report_iter=100, 
         lr=1.0, input_mask=None, initial_weights=None, eps=1e-4, 
-        return_history=False, verbose=True, seq_length=1048576):
+        return_history=False, verbose=True, seq_length=1048576, slice_start=523288, slice_end=525288):
         super().__init__()
         
         for param in model.parameters():
@@ -156,7 +156,9 @@ class Ledidi(torch.nn.Module):
         self.return_history = return_history
         self.verbose = verbose
         self.seq_length = seq_length
-
+        self.slice_start = slice_start
+        self.slice_end = slice_end
+        
         if target is None:
             self.target = slice(target)
         else:
@@ -168,8 +170,11 @@ class Ledidi(torch.nn.Module):
         else:
             initial_weights.requires_grad = True
         
-        self.weights = torch.nn.Parameter(initial_weights)
-        
+        # self.weights = torch.nn.Parameter(initial_weights)
+        # when slicing implemented
+        self.weights = torch.nn.Parameter(
+            torch.zeros((1, 4, self.slice_end - self.slice_start), dtype=torch.float32, requires_grad=True)
+        )
 
     def forward(self, X):
         """Generate a set of edits given a sequence.
@@ -194,10 +199,21 @@ class Ledidi(torch.nn.Module):
             may contain one or more edits compared to the sequence that was
             passed in.
         """        
-        logits = torch.log(X + self.eps) + self.weights
+        # logits = torch.log(X + self.eps) + self.weights
+        # when slicing implemented
+        logits = torch.log(X[:, :, self.slice_start:self.slice_end] + self.eps) + self.weights
+        
         logits = logits.expand(self.batch_size, *(-1 for i in range(X.ndim-1)))
-        return torch.nn.functional.gumbel_softmax(logits, tau=self.tau, 
-            hard=True, dim=1)
+        edited_slice = torch.nn.functional.gumbel_softmax(logits, tau=self.tau, hard=True, dim=1)
+        
+        # return torch.nn.functional.gumbel_softmax(logits, tau=self.tau, 
+        #     hard=True, dim=1)
+        
+        # when slicing implemented
+        # Reconstruct full sequence
+        X_hat = X.clone()
+        X_hat[:, :, self.slice_start:self.slice_end] = edited_slice
+        return X_hat
         
 
     def fit_transform(self, X, y_bar):
@@ -265,19 +281,27 @@ class Ledidi(torch.nn.Module):
 
         for i in range(1, self.max_iter+1):
             X_hat = self(X)
+            
             y_hat = self.model(X_hat)[:, self.target]
             
             # # change from [1,1,length] to [1,length]
             # needs to be uncomment, if there is only one target
-            # y_hat = y_hat.squeeze(0)
+            y_hat = y_hat.squeeze(0)
             
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
+            
             output_loss = self.output_loss(y_hat, y_bar)
-            # output_loss = output_loss.float()
             total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
-
+            
             optimizer.zero_grad()
-            total_loss.backward()
+            # total_loss.backward()
+            
+            # slicing
+            total_loss.backward(retain_graph=True)
+            # Zero out gradients for non-editable regions
+            if self.weights.grad is not None:
+                self.weights.grad = self.weights.grad
+            
             optimizer.step()
 
             input_loss = input_loss.item()
@@ -298,8 +322,6 @@ class Ledidi(torch.nn.Module):
                 history['total_loss'].append(total_loss)
 
             if total_loss < best_total_loss:
-            # if total_loss < 2.519e+04:
-            # if total_loss < 0.25:
                 best_input_loss = input_loss
                 best_output_loss = output_loss
                 best_total_loss = total_loss
