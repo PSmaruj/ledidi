@@ -61,10 +61,6 @@ class Ledidi(torch.nn.Module):
         A model to use as an oracle that will be frozen as a part of the
         Ledidi procedure.
 
-    shape: tuple of two integers
-        The number of categories and the number of positions, respectively,
-        in the sequence to be edited. For nucleotides this might be (4, 1000).
-
     target: int or None
         When given a multi-task model, the target to slice out and feed into
         output_loss when calculating the gradient. If None, perform no slicing.
@@ -131,11 +127,11 @@ class Ledidi(torch.nn.Module):
         Whether to print the loss during design. Default is True.
     """
 
-    def __init__(self, model, shape, target=None, input_loss=torch.nn.L1Loss(
+    def __init__(self, model, target=None, input_loss=torch.nn.L1Loss(
         reduction='sum'), output_loss=torch.nn.MSELoss(), tau=1, l=0.1, 
-        batch_size=16, max_iter=1000, early_stopping_iter=100, report_iter=100, 
+        batch_size=10, max_iter=1000, early_stopping_iter=100, report_iter=100, 
         lr=1.0, input_mask=None, initial_weights=None, eps=1e-4, 
-        return_history=False, verbose=True, seq_length=1048576, slice_start=523288, slice_end=525288):
+        return_history=False, verbose=True, num_channels = 4, seq_length=1048576, slice_start=523288, slice_end=525288):
         super().__init__()
         
         for param in model.parameters():
@@ -155,6 +151,7 @@ class Ledidi(torch.nn.Module):
         self.eps = eps
         self.return_history = return_history
         self.verbose = verbose
+        self.num_channels = num_channels
         self.seq_length = seq_length
         self.slice_start = slice_start
         self.slice_end = slice_end
@@ -165,13 +162,11 @@ class Ledidi(torch.nn.Module):
             self.target = slice(target, target+1)
 
         if initial_weights is None:
-            initial_weights = torch.zeros((1, 4, seq_length), dtype=torch.float32,
+            initial_weights = torch.zeros((1, self.num_channels, self.seq_length), dtype=torch.float32,
                 requires_grad=True)
         else:
             initial_weights.requires_grad = True
         
-        # self.weights = torch.nn.Parameter(initial_weights)
-        # when slicing implemented
         self.weights = torch.nn.Parameter(
             torch.zeros((1, 4, self.slice_end - self.slice_start), dtype=torch.float32, requires_grad=True)
         )
@@ -199,20 +194,21 @@ class Ledidi(torch.nn.Module):
             may contain one or more edits compared to the sequence that was
             passed in.
         """        
-        # logits = torch.log(X + self.eps) + self.weights
-        # when slicing implemented
         logits = torch.log(X[:, :, self.slice_start:self.slice_end] + self.eps) + self.weights
         
-        logits = logits.expand(self.batch_size, *(-1 for i in range(X.ndim-1)))
+        # Expand X to create batch_size copies
+        X_expanded = X.expand(self.batch_size, *X.shape[1:])
+        
+        # more readable than
+        # logits = logits.expand(self.batch_size, *(-1 for i in range(X.ndim-1)))
+        logits = logits.expand(self.batch_size, -1, -1)
+        
         edited_slice = torch.nn.functional.gumbel_softmax(logits, tau=self.tau, hard=True, dim=1)
+
+        # Create a batch of modified sequences
+        X_hat = X_expanded.clone()
+        X_hat[:, :, self.slice_start:self.slice_end] = edited_slice  # Replace the slice in all copies
         
-        # return torch.nn.functional.gumbel_softmax(logits, tau=self.tau, 
-        #     hard=True, dim=1)
-        
-        # when slicing implemented
-        # Reconstruct full sequence
-        X_hat = X.clone()
-        X_hat[:, :, self.slice_start:self.slice_end] = edited_slice
         return X_hat
         
 
@@ -258,7 +254,7 @@ class Ledidi(torch.nn.Module):
             self.weights.requires_grad = True
         
         inpainting_mask = X[0].sum(dim=0) == 1
-        y_hat = self.model(X)[:, self.target]
+        y_hat = self.model(X)[:, self.target].squeeze(1)
         
         n_iter_wo_improvement = 0        
         output_loss = self.output_loss(y_hat, y_bar).item()
@@ -269,8 +265,11 @@ class Ledidi(torch.nn.Module):
         best_sequence = X
         best_weights = torch.clone(self.weights)
         
+        # X_ is the original sequence
         X_ = X.expand(self.batch_size, *X.shape[1:])
-        y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
+        # y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
+        
+        y_bar = y_bar.unsqueeze(1).repeat(self.batch_size, 1, 1)
         
         tic = time.time()
         initial_tic = time.time()
@@ -281,16 +280,12 @@ class Ledidi(torch.nn.Module):
 
         for i in range(1, self.max_iter+1):
             X_hat = self(X)
-            
             y_hat = self.model(X_hat)[:, self.target]
-            
-            # # change from [1,1,length] to [1,length]
-            # needs to be uncomment, if there is only one target
-            y_hat = y_hat.squeeze(0)
             
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
             
-            output_loss = self.output_loss(y_hat, y_bar)
+            # output_loss avraged over batch_size
+            output_loss = self.output_loss(y_hat, y_bar) / self.batch_size
             total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
             
             optimizer.zero_grad()
