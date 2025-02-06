@@ -267,9 +267,12 @@ class Ledidi(torch.nn.Module):
         
         # X_ is the original sequence
         X_ = X.expand(self.batch_size, *X.shape[1:])
-        # y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
         
-        y_bar = y_bar.unsqueeze(1).repeat(self.batch_size, 1, 1)
+        # Ensure y_bar has shape (1, num_targets, 99681)
+        if y_bar.dim() == 2:
+            y_bar = y_bar.unsqueeze(1)
+                
+        y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
         
         tic = time.time()
         initial_tic = time.time()
@@ -283,7 +286,7 @@ class Ledidi(torch.nn.Module):
             y_hat = self.model(X_hat)[:, self.target]
             
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
-            
+                        
             # output_loss avraged over batch_size
             output_loss = self.output_loss(y_hat, y_bar) / self.batch_size
             total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
