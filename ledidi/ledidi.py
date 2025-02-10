@@ -6,6 +6,13 @@ import time
 import torch
 
 
+def check_memory(tag=""):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # Convert to MB
+        reserved = torch.cuda.memory_reserved() / (1024 ** 2)  # Convert to MB
+        print(f"[{tag}] Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB")
+
+
 class DesignWrapper(torch.nn.Module):
     """A wrapper for using multiple models in design.
 
@@ -168,7 +175,7 @@ class Ledidi(torch.nn.Module):
             initial_weights.requires_grad = True
         
         self.weights = torch.nn.Parameter(
-            torch.zeros((1, 4, self.slice_end - self.slice_start), dtype=torch.float32, requires_grad=True)
+            torch.zeros((1, self.num_channels, self.slice_end - self.slice_start), dtype=torch.float32, requires_grad=True)
         )
 
     def forward(self, X):
@@ -199,10 +206,7 @@ class Ledidi(torch.nn.Module):
         # Expand X to create batch_size copies
         X_expanded = X.expand(self.batch_size, *X.shape[1:])
         
-        # more readable than
-        # logits = logits.expand(self.batch_size, *(-1 for i in range(X.ndim-1)))
         logits = logits.expand(self.batch_size, -1, -1)
-        
         edited_slice = torch.nn.functional.gumbel_softmax(logits, tau=self.tau, hard=True, dim=1)
 
         # Create a batch of modified sequences
@@ -253,22 +257,29 @@ class Ledidi(torch.nn.Module):
             self.weights[X.type(torch.bool)] = 0
             self.weights.requires_grad = True
         
+        # inpainting_mask - ensures only the edited positions
+        # are taken into account while input_loss is calculates
         inpainting_mask = X[0].sum(dim=0) == 1
+                
+        # prediction for the input sequence
         y_hat = self.model(X)[:, self.target].squeeze(1)
         
-        n_iter_wo_improvement = 0        
+        n_iter_wo_improvement = 0
+        
+        # loss between the prediction of the original sequence
+        # and the desired prediction (aka starting loss)      
         output_loss = self.output_loss(y_hat, y_bar).item()
 
         best_input_loss = 0.0
         best_output_loss = output_loss
-        best_total_loss = output_loss
+        best_total_loss = 10000000.0
         best_sequence = X
         best_weights = torch.clone(self.weights)
         
         # X_ is the original sequence
         X_ = X.expand(self.batch_size, *X.shape[1:])
         
-        # Ensure y_bar has shape (1, num_targets, 99681)
+        # Ensure y_bar has shape (batch_size, num_targets, vector_len)
         if y_bar.dim() == 2:
             y_bar = y_bar.unsqueeze(1)
                 
@@ -282,24 +293,28 @@ class Ledidi(torch.nn.Module):
                     best_total_loss))
 
         for i in range(1, self.max_iter+1):
+            # generating new sequence -> FORWARD PASS
             X_hat = self(X)
+            
+            # prediction for the new sequence
             y_hat = self.model(X_hat)[:, self.target]
             
+            # loss between the new and original sequence
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
                         
             # output_loss avraged over batch_size
             output_loss = self.output_loss(y_hat, y_bar) / self.batch_size
             total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
             
+            # BACKWARD PASS
+            # gradient calculation and weights update
             optimizer.zero_grad()
-            # total_loss.backward()
             
             # slicing
             total_loss.backward(retain_graph=True)
             # Zero out gradients for non-editable regions
             if self.weights.grad is not None:
                 self.weights.grad = self.weights.grad
-            
             optimizer.step()
 
             input_loss = input_loss.item()
@@ -341,7 +356,7 @@ class Ledidi(torch.nn.Module):
                 "total_loss={:4.4}\ttime={:4.4}").format(best_input_loss, 
                     best_output_loss, best_total_loss, 
                     time.time() - initial_tic))
-
+        
         if self.return_history:
             return best_sequence, history
         return best_sequence
