@@ -168,11 +168,11 @@ class Ledidi(torch.nn.Module):
         else:
             self.target = slice(target, target+1)
 
-        if initial_weights is None:
-            initial_weights = torch.zeros((1, self.num_channels, self.seq_length), dtype=torch.float32,
-                requires_grad=True)
-        else:
-            initial_weights.requires_grad = True
+        # if initial_weights is None:
+        #     initial_weights = torch.zeros((1, self.num_channels, self.seq_length), dtype=torch.float32,
+        #         requires_grad=True)
+        # else:
+        #     initial_weights.requires_grad = True
         
         self.weights = torch.nn.Parameter(
             torch.zeros((1, self.num_channels, self.slice_end - self.slice_start), dtype=torch.float32, requires_grad=True)
@@ -251,11 +251,11 @@ class Ledidi(torch.nn.Module):
         history = {'edits': [], 'input_loss': [], 'output_loss': [], 
             'total_loss': [], 'batch_size': self.batch_size}
 
-        if self.input_mask is not None:
-            self.weights.requires_grad = False
-            self.weights[:, :, self.input_mask] = float("-inf")
-            self.weights[X.type(torch.bool)] = 0
-            self.weights.requires_grad = True
+        # if self.input_mask is not None:
+        #     self.weights.requires_grad = False
+        #     self.weights[:, :, self.input_mask] = float("-inf")
+        #     self.weights[X.type(torch.bool)] = 0
+        #     self.weights.requires_grad = True
         
         # inpainting_mask - ensures only the edited positions
         # are taken into account while input_loss is calculates
@@ -272,7 +272,7 @@ class Ledidi(torch.nn.Module):
 
         best_input_loss = 0.0
         best_output_loss = output_loss
-        best_total_loss = 10000000.0
+        best_total_loss = output_loss
         best_sequence = X
         best_weights = torch.clone(self.weights)
         
