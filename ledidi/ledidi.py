@@ -134,7 +134,7 @@ class Ledidi(torch.nn.Module):
         Whether to print the loss during design. Default is True.
     """
 
-    def __init__(self, model, target=None, input_loss=torch.nn.L1Loss(
+    def __init__(self, model, cached_model, target=None, input_loss=torch.nn.L1Loss(
         reduction='sum'), output_loss=torch.nn.MSELoss(), tau=1, l=0.1, 
         batch_size=10, max_iter=1000, early_stopping_iter=100, report_iter=100, 
         lr=1.0, input_mask=None, initial_weights=None, eps=1e-4, 
@@ -145,6 +145,7 @@ class Ledidi(torch.nn.Module):
             param.requires_grad = False
             
         self.model = model.eval()
+        self.cached_model = cached_model  # Cached model wrapper
         self.input_loss = input_loss
         self.output_loss = output_loss
         self.tau = tau
@@ -168,11 +169,11 @@ class Ledidi(torch.nn.Module):
         else:
             self.target = slice(target, target+1)
 
-        # if initial_weights is None:
-        #     initial_weights = torch.zeros((1, self.num_channels, self.seq_length), dtype=torch.float32,
-        #         requires_grad=True)
-        # else:
-        #     initial_weights.requires_grad = True
+        if initial_weights is None:
+            initial_weights = torch.zeros((1, self.num_channels, self.seq_length), dtype=torch.float32,
+                requires_grad=True)
+        else:
+            initial_weights.requires_grad = True
         
         self.weights = torch.nn.Parameter(
             torch.zeros((1, self.num_channels, self.slice_end - self.slice_start), dtype=torch.float32, requires_grad=True)
@@ -250,19 +251,14 @@ class Ledidi(torch.nn.Module):
         optimizer = torch.optim.AdamW((self.weights,), lr=self.lr)
         history = {'edits': [], 'input_loss': [], 'output_loss': [], 
             'total_loss': [], 'batch_size': self.batch_size}
-
-        # if self.input_mask is not None:
-        #     self.weights.requires_grad = False
-        #     self.weights[:, :, self.input_mask] = float("-inf")
-        #     self.weights[X.type(torch.bool)] = 0
-        #     self.weights.requires_grad = True
         
         # inpainting_mask - ensures only the edited positions
         # are taken into account while input_loss is calculates
         inpainting_mask = X[0].sum(dim=0) == 1
                 
         # prediction for the input sequence
-        y_hat = self.model(X)[:, self.target].squeeze(1)
+        # y_hat = self.model(X)[:, self.target].squeeze(1)
+        y_hat = self.cached_model(X)[:, self.target].squeeze(1)[0]
         
         n_iter_wo_improvement = 0
         
@@ -296,9 +292,14 @@ class Ledidi(torch.nn.Module):
             # generating new sequence -> FORWARD PASS
             X_hat = self(X)
             
-            # prediction for the new sequence
-            y_hat = self.model(X_hat)[:, self.target]
+            changed_indices = (self.slice_start, self.slice_end)
             
+            # print("X_hat differences:", torch.sum(X_hat != X))
+            
+            # prediction for the new sequence
+            # y_hat = self.model(X_hat)[:, self.target]
+            y_hat = self.cached_model(X_hat, changed_indices=changed_indices)[:, self.target]
+                
             # loss between the new and original sequence
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
                         
