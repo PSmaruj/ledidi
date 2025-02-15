@@ -5,6 +5,10 @@
 import time
 import torch
 
+import sys
+sys.path.insert(0, "/home1/smaruj/AkitaMini-pytorch")  # Add the directory where "ledidi" is located
+from semifreddo_model import Semifreddo
+
 
 def check_memory(tag=""):
     if torch.cuda.is_available():
@@ -134,18 +138,20 @@ class Ledidi(torch.nn.Module):
         Whether to print the loss during design. Default is True.
     """
 
-    def __init__(self, model, cached_model, target=None, input_loss=torch.nn.L1Loss(
-        reduction='sum'), output_loss=torch.nn.MSELoss(), tau=1, l=0.1, 
-        batch_size=10, max_iter=1000, early_stopping_iter=100, report_iter=100, 
-        lr=1.0, input_mask=None, initial_weights=None, eps=1e-4, 
-        return_history=False, verbose=True, num_channels = 4, seq_length=1048576, slice_start=523288, slice_end=525288):
+    def __init__(self, model, target=None, 
+                 input_loss=torch.nn.L1Loss(reduction='sum'), 
+                 output_loss=torch.nn.MSELoss(), 
+                 tau=1, l=0.1, 
+                 batch_size=10, max_iter=1000, early_stopping_iter=100, report_iter=100, lr=1.0, eps=1e-4, 
+                 return_history=False, verbose=True, 
+                 num_channels = 4, slice_length=512, slice_index=21,
+                 use_semifreddo=True):
         super().__init__()
         
         for param in model.parameters():
             param.requires_grad = False
             
         self.model = model.eval()
-        self.cached_model = cached_model  # Cached model wrapper
         self.input_loss = input_loss
         self.output_loss = output_loss
         self.tau = tau
@@ -155,30 +161,37 @@ class Ledidi(torch.nn.Module):
         self.early_stopping_iter = early_stopping_iter
         self.report_iter = report_iter
         self.lr = lr
-        self.input_mask = input_mask
         self.eps = eps
         self.return_history = return_history
         self.verbose = verbose
         self.num_channels = num_channels
-        self.seq_length = seq_length
-        self.slice_start = slice_start
-        self.slice_end = slice_end
+        self.slice_length = slice_length
+        self.slice_index = slice_index
+        self.use_semifreddo = use_semifreddo
         
         if target is None:
             self.target = slice(target)
         else:
             self.target = slice(target, target+1)
-
-        if initial_weights is None:
-            initial_weights = torch.zeros((1, self.num_channels, self.seq_length), dtype=torch.float32,
-                requires_grad=True)
-        else:
-            initial_weights.requires_grad = True
         
-        self.weights = torch.nn.Parameter(
-            torch.zeros((1, self.num_channels, self.slice_end - self.slice_start), dtype=torch.float32, requires_grad=True)
-        )
+        if self.use_semifreddo:
+            self.weights = torch.nn.Parameter(
+                torch.zeros((1, self.num_channels, self.slice_length), dtype=torch.float32, requires_grad=True)
+            )
+        else:
+            slice_start, slice_end = 10752, 11264
+            self.weights = torch.nn.Parameter(
+                torch.zeros((1, self.num_channels, slice_end - slice_start), dtype=torch.float32, requires_grad=True)
+            )
 
+        # model in interferance mode
+        # self.model = model.eval()
+        self.model = model.train()
+        
+        print("Gradients enabled for weights:", self.weights.requires_grad)
+        print("Model in train mode:", self.model.training)
+        print("Weights shape", self.weights.shape)
+        
     def forward(self, X):
         """Generate a set of edits given a sequence.
 
@@ -200,10 +213,14 @@ class Ledidi(torch.nn.Module):
         y: torch.Tensor, shape=(batch_size, n_channels, length)
             A tensor containing a batch of one-hot encoded sequences which
             may contain one or more edits compared to the sequence that was
-            passed in.
+            passed in. 
         """        
-        logits = torch.log(X[:, :, self.slice_start:self.slice_end] + self.eps) + self.weights
-        
+        if self.use_semifreddo:
+            logits = torch.log(X + self.eps) + self.weights
+        else:
+            slice_start, slice_end = 10752, 11264
+            logits = torch.log(X[:, :, slice_start:slice_end] + self.eps) + self.weights
+            
         # Expand X to create batch_size copies
         X_expanded = X.expand(self.batch_size, *X.shape[1:])
         
@@ -212,12 +229,17 @@ class Ledidi(torch.nn.Module):
 
         # Create a batch of modified sequences
         X_hat = X_expanded.clone()
-        X_hat[:, :, self.slice_start:self.slice_end] = edited_slice  # Replace the slice in all copies
         
+        if self.use_semifreddo:
+            X_hat = edited_slice  # Replace the slice in all copies
+        else:
+            slice_start, slice_end = 10752, 11264
+            X_hat[:, :, slice_start:slice_end] = edited_slice
+            
         return X_hat
         
 
-    def fit_transform(self, X, y_bar):
+    def fit_transform(self, X, y_bar, X_l_flank, X_r_flank):
         """Apply the Ledidi procedure to design edits for a sequence.
 
         This procedure takes in a single sequence and a desired output from
@@ -252,13 +274,21 @@ class Ledidi(torch.nn.Module):
         history = {'edits': [], 'input_loss': [], 'output_loss': [], 
             'total_loss': [], 'batch_size': self.batch_size}
         
-        # inpainting_mask - ensures only the edited positions
+        # inpainting_mask - ensures only the valid positions
         # are taken into account while input_loss is calculates
         inpainting_mask = X[0].sum(dim=0) == 1
-                
+
+        saved_out_path = "/scratch1/smaruj/ledidi_targets/tower_out.pt"
+        
+        flanked_X = torch.cat((X_l_flank, X, X_r_flank), dim=-1)
+
         # prediction for the input sequence
-        # y_hat = self.model(X)[:, self.target].squeeze(1)
-        y_hat = self.cached_model(X)[:, self.target].squeeze(1)[0]
+        if self.use_semifreddo:
+            semifreddo_model = Semifreddo(flanked_X, self.slice_index, self.model, saved_out_path, batch_size=1)
+            y_hat = semifreddo_model.forward()
+        else:
+            y_hat = self.model(X)[:, self.target]
+        y_hat = y_hat.squeeze(1)
         
         n_iter_wo_improvement = 0
         
@@ -288,21 +318,28 @@ class Ledidi(torch.nn.Module):
                 "total_loss={:4.4}\ttime=0.0").format(output_loss, 
                     best_total_loss))
 
+        # Expandinf flanking sequences
+        X_l_flank_batch = X_l_flank.repeat(10, 1, 1)
+        X_r_flank_batch = X_r_flank.repeat(10, 1, 1)
+        
         for i in range(1, self.max_iter+1):
             # generating new sequence -> FORWARD PASS
             X_hat = self(X)
             
-            changed_indices = (self.slice_start, self.slice_end)
-            
-            # print("X_hat differences:", torch.sum(X_hat != X))
-            
             # prediction for the new sequence
-            # y_hat = self.model(X_hat)[:, self.target]
-            y_hat = self.cached_model(X_hat, changed_indices=changed_indices)[:, self.target]
+            if self.use_semifreddo:
+                saved_out_path = "/scratch1/smaruj/ledidi_targets/tower_out.pt"
+                flanked_X_hat = torch.cat((X_l_flank_batch, X_hat, X_r_flank_batch), dim=-1)
                 
+                semifreddo_model = Semifreddo(flanked_X_hat, self.slice_index, self.model, saved_out_path, batch_size=10)
+                y_hat = semifreddo_model.forward()
+            else:
+                y_hat = self.model(X_hat)[:, self.target]
+          
             # loss between the new and original sequence
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
-                        
+            # input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask])
+                
             # output_loss avraged over batch_size
             output_loss = self.output_loss(y_hat, y_bar) / self.batch_size
             total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
@@ -310,12 +347,7 @@ class Ledidi(torch.nn.Module):
             # BACKWARD PASS
             # gradient calculation and weights update
             optimizer.zero_grad()
-            
-            # slicing
             total_loss.backward(retain_graph=True)
-            # Zero out gradients for non-editable regions
-            if self.weights.grad is not None:
-                self.weights.grad = self.weights.grad
             optimizer.step()
 
             input_loss = input_loss.item()
@@ -360,4 +392,5 @@ class Ledidi(torch.nn.Module):
         
         if self.return_history:
             return best_sequence, history
+        
         return best_sequence
