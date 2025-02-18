@@ -6,7 +6,6 @@ import time
 import torch
 
 import sys
-sys.path.insert(0, "/home1/smaruj/AkitaMini-pytorch")  # Add the directory where "ledidi" is located
 from semifreddo_model import Semifreddo
 
 
@@ -150,8 +149,10 @@ class Ledidi(torch.nn.Module):
         
         for param in model.parameters():
             param.requires_grad = False
-            
+        
+        # model in eval mode
         self.model = model.eval()
+        
         self.input_loss = input_loss
         self.output_loss = output_loss
         self.tau = tau
@@ -183,10 +184,6 @@ class Ledidi(torch.nn.Module):
             self.weights = torch.nn.Parameter(
                 torch.zeros((1, self.num_channels, slice_end - slice_start), dtype=torch.float32, requires_grad=True)
             )
-
-        # model in interferance mode
-        # self.model = model.eval()
-        self.model = model.train()
         
         print("Gradients enabled for weights:", self.weights.requires_grad)
         print("Model in train mode:", self.model.training)
@@ -302,8 +299,8 @@ class Ledidi(torch.nn.Module):
         best_sequence = X
         best_weights = torch.clone(self.weights)
         
-        # X_ is the original sequence
-        X_ = X.expand(self.batch_size, *X.shape[1:])
+        # X_ is the original sequence expanded to the batch size
+        X_ = X.repeat(self.batch_size, 1, 1)
         
         # Ensure y_bar has shape (batch_size, num_targets, vector_len)
         if y_bar.dim() == 2:
@@ -337,7 +334,7 @@ class Ledidi(torch.nn.Module):
                 y_hat = self.model(X_hat)[:, self.target]
           
             # loss between the new and original sequence
-            input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
+            input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
             # input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask])
                 
             # output_loss avraged over batch_size
@@ -348,6 +345,10 @@ class Ledidi(torch.nn.Module):
             # gradient calculation and weights update
             optimizer.zero_grad()
             total_loss.backward(retain_graph=True)
+            
+            # grad_norm = self.weights.grad.norm()
+            # print(f"Gradient magnitude: {grad_norm.item()}")
+            
             optimizer.step()
 
             input_loss = input_loss.item()
