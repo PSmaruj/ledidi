@@ -1,6 +1,13 @@
 import torch
 
 
+def check_memory(tag=""):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # Convert to MB
+        reserved = torch.cuda.memory_reserved() / (1024 ** 2)  # Convert to MB
+        print(f"[{tag}] Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB")
+
+
 class Semifreddo():
     def __init__(self, sequence, edited_index, model, saved_out_path, batch_size):
         self.sequence = sequence
@@ -15,19 +22,21 @@ class Semifreddo():
     def forward(self):    
         
         self.model = self.model.eval()
-            
+        
         #passing an edited sequence though the top of model
         sub_x = self.model.conv_block_1(self.sequence)
         sub_x = self.model.conv_tower(sub_x)
-    
+
         # loading saved output (for one sequence)
         x = torch.load(self.saved_out_path, weights_only=True)
         x = x.clone()  # Clone it to avoid modifying the original tensor
-        
+
         if self.batch_size > 1:
             x = x.repeat(self.batch_size, 1, 1)
         
-        x[:, :, self.edited_index] = sub_x[:,:,2].squeeze(-1) #2 becaise, there are 5 bins, we need the middle one
+        # x[:, :, self.edited_index] = sub_x[:,:,2].squeeze(-1) #2 becaise, there are 5 bins, we need the middle one
+        # for now, 3 bins get updated
+        x[:, :, self.edited_index-1:self.edited_index+1] = sub_x[:,:,1:3].squeeze(-1)
         
         x = self.model.residual1d_block1(x)
         x = self.model.conv_reduce(x)
