@@ -6,7 +6,8 @@ import time
 import torch
 
 import sys
-from semifreddo_model import Semifreddo
+# from semifreddo_model import Semifreddo
+from semifreddo_full_model import Semifreddo
 
 
 def check_memory(tag=""):
@@ -143,8 +144,8 @@ class Ledidi(torch.nn.Module):
                  tau=1, l=0.1, 
                  batch_size=10, max_iter=1000, early_stopping_iter=100, report_iter=100, lr=1.0, eps=1e-4, 
                  return_history=False, verbose=True, 
-                 num_channels = 4, slice_length=512, slice_index=21,
-                 use_semifreddo=True):
+                 num_channels = 4, slice_length=2048, slice_index=21,
+                 use_semifreddo=True, saved_tmp_out="/scratch1/smaruj/ledidi_targets/full_tower_out.pt"):
         super().__init__()
         
         for param in model.parameters():
@@ -169,6 +170,7 @@ class Ledidi(torch.nn.Module):
         self.slice_length = slice_length
         self.slice_index = slice_index
         self.use_semifreddo = use_semifreddo
+        self.saved_tmp_out = saved_tmp_out
         
         if target is None:
             self.target = slice(target)
@@ -180,9 +182,8 @@ class Ledidi(torch.nn.Module):
                 torch.zeros((1, self.num_channels, self.slice_length), dtype=torch.float32, requires_grad=True)
             )
         else:
-            slice_start, slice_end = 10752, 11264
             self.weights = torch.nn.Parameter(
-                torch.zeros((1, self.num_channels, slice_end - slice_start), dtype=torch.float32, requires_grad=True)
+                torch.zeros((1, self.num_channels, self.slice_length), dtype=torch.float32, requires_grad=True)
             )
         
         print("Gradients enabled for weights:", self.weights.requires_grad)
@@ -215,7 +216,8 @@ class Ledidi(torch.nn.Module):
         if self.use_semifreddo:
             logits = torch.log(X + self.eps) + self.weights
         else:
-            slice_start, slice_end = 10752, 11264
+            # slice_start, slice_end = 10752, 11264
+            slice_start, slice_end = 523264, 525312
             logits = torch.log(X[:, :, slice_start:slice_end] + self.eps) + self.weights
             
         # Expand X to create batch_size copies
@@ -230,7 +232,8 @@ class Ledidi(torch.nn.Module):
         if self.use_semifreddo:
             X_hat = edited_slice  # Replace the slice in all copies
         else:
-            slice_start, slice_end = 10752, 11264
+            # slice_start, slice_end = 10752, 11264
+            slice_start, slice_end = 523264, 525312
             X_hat[:, :, slice_start:slice_end] = edited_slice
             
         return X_hat
@@ -274,14 +277,12 @@ class Ledidi(torch.nn.Module):
         # inpainting_mask - ensures only the valid positions
         # are taken into account while input_loss is calculates
         inpainting_mask = X[0].sum(dim=0) == 1
-
-        saved_out_path = "/scratch1/smaruj/ledidi_targets/tower_out.pt"
         
         flanked_X = torch.cat((X_l_flank, X, X_r_flank), dim=-1)
 
         # prediction for the input sequence
         if self.use_semifreddo:
-            semifreddo_model = Semifreddo(flanked_X, self.slice_index, self.model, saved_out_path, batch_size=1)
+            semifreddo_model = Semifreddo(flanked_X, self.slice_index, self.model, self.saved_tmp_out, batch_size=1)
             y_hat = semifreddo_model.forward()
         else:
             y_hat = self.model(X)[:, self.target]
@@ -316,8 +317,8 @@ class Ledidi(torch.nn.Module):
                     best_total_loss))
 
         # Expandinf flanking sequences
-        X_l_flank_batch = X_l_flank.repeat(10, 1, 1)
-        X_r_flank_batch = X_r_flank.repeat(10, 1, 1)
+        X_l_flank_batch = X_l_flank.repeat(self.batch_size, 1, 1)
+        X_r_flank_batch = X_r_flank.repeat(self.batch_size, 1, 1)
         
         for i in range(1, self.max_iter+1):
             # generating new sequence -> FORWARD PASS
@@ -325,10 +326,9 @@ class Ledidi(torch.nn.Module):
             
             # prediction for the new sequence
             if self.use_semifreddo:
-                saved_out_path = "/scratch1/smaruj/ledidi_targets/tower_out.pt"
                 flanked_X_hat = torch.cat((X_l_flank_batch, X_hat, X_r_flank_batch), dim=-1)
                 
-                semifreddo_model = Semifreddo(flanked_X_hat, self.slice_index, self.model, saved_out_path, batch_size=10)
+                semifreddo_model = Semifreddo(flanked_X_hat, self.slice_index, self.model, self.saved_tmp_out, batch_size=self.batch_size)
                 y_hat = semifreddo_model.forward()
             else:
                 y_hat = self.model(X_hat)[:, self.target]
