@@ -9,6 +9,8 @@ import sys
 # from semifreddo_model import Semifreddo
 from semifreddo_full_model import Semifreddo
 
+import numpy as np
+
 
 def check_memory(tag=""):
     if torch.cuda.is_available():
@@ -290,9 +292,19 @@ class Ledidi(torch.nn.Module):
         
         n_iter_wo_improvement = 0
         
+        # temp: LOCAL LOSS - flame indices
+        # loaded_indices = np.load("/home1/smaruj/ledidi_akita/fragment_indices.npy")
+        # loaded_indices = torch.tensor(loaded_indices, dtype=torch.long, device=y_hat.device)
+        
+        # # Index the last dimension
+        # y_hat_selected = y_hat[..., loaded_indices]  # Shape: (1, 5, 4414)
+        # y_bar_selected = y_bar[..., loaded_indices]
+        
+        # output_loss = self.output_loss(y_hat_selected, y_bar_selected).item() * 10**7
+        
         # loss between the prediction of the original sequence
         # and the desired prediction (aka starting loss)      
-        output_loss = self.output_loss(y_hat, y_bar).item()
+        output_loss = self.output_loss(y_hat, y_bar).item() * 10**7
 
         best_input_loss = 0.0
         best_output_loss = output_loss
@@ -335,10 +347,17 @@ class Ledidi(torch.nn.Module):
           
             # loss between the new and original sequence
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
-            # input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask])
                 
             # output_loss avraged over batch_size
-            output_loss = self.output_loss(y_hat, y_bar) / self.batch_size
+            output_loss = self.output_loss(y_hat, y_bar) * 10**7
+            
+            # LOCAL LOSS
+            # y_hat_selected = y_hat[..., loaded_indices]  # Shape: (1, 5, 4414)
+            # y_bar_selected = y_bar[..., loaded_indices]
+            # output_loss = self.output_loss(y_hat_selected, y_bar_selected) * 10**7
+            
+            output_loss = output_loss / self.batch_size
+            
             total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
             
             # BACKWARD PASS
