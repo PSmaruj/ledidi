@@ -146,7 +146,7 @@ class Ledidi(torch.nn.Module):
                  tau=1, l=0.1, 
                  batch_size=10, max_iter=1000, early_stopping_iter=100, report_iter=100, lr=1.0, eps=1e-4, 
                  return_history=False, verbose=True, 
-                 num_channels = 4, slice_length=2048, slice_index=21,
+                 num_channels = 4, slice_length=2048, slice_index_0=21, slice_index_1=None,
                  use_semifreddo=True, saved_tmp_out="/scratch1/smaruj/ledidi_targets/full_tower_out.pt"):
         super().__init__()
         
@@ -170,7 +170,8 @@ class Ledidi(torch.nn.Module):
         self.verbose = verbose
         self.num_channels = num_channels
         self.slice_length = slice_length
-        self.slice_index = slice_index
+        self.slice_index_0 = slice_index_0
+        self.slice_index_1 = slice_index_1
         self.use_semifreddo = use_semifreddo
         self.saved_tmp_out = saved_tmp_out
         
@@ -179,18 +180,23 @@ class Ledidi(torch.nn.Module):
         else:
             self.target = slice(target, target+1)
         
-        if self.use_semifreddo:
-            self.weights = torch.nn.Parameter(
-                torch.zeros((1, self.num_channels, self.slice_length), dtype=torch.float32, requires_grad=True)
-            )
-        else:
-            self.weights = torch.nn.Parameter(
+        self.weights_0 = torch.nn.Parameter(
+            torch.zeros((1, self.num_channels, self.slice_length), dtype=torch.float32, requires_grad=True)
+        )
+        
+        if self.slice_index_1 is not None:
+            self.weights_1 = torch.nn.Parameter(
                 torch.zeros((1, self.num_channels, self.slice_length), dtype=torch.float32, requires_grad=True)
             )
         
-        print("Gradients enabled for weights:", self.weights.requires_grad)
         print("Model in train mode:", self.model.training)
-        print("Weights shape", self.weights.shape)
+        
+        print("Gradients enabled for weights:", self.weights_0.requires_grad)
+        print("Weights shape", self.weights_0.shape)
+        
+        if self.slice_index_1 is not None:
+            print("Gradients enabled for weights 1:", self.weights_1.requires_grad)
+            print("Weights 1 shape", self.weights_1.shape)
         
     def forward(self, X):
         """Generate a set of edits given a sequence.
@@ -215,19 +221,32 @@ class Ledidi(torch.nn.Module):
             may contain one or more edits compared to the sequence that was
             passed in. 
         """        
+        
         if self.use_semifreddo:
-            logits = torch.log(X + self.eps) + self.weights
+            logits = torch.log(X + self.eps) + self.weights_0
         else:
             # slice_start, slice_end = 10752, 11264
-            slice_start, slice_end = 523264, 525312
-            logits = torch.log(X[:, :, slice_start:slice_end] + self.eps) + self.weights
+            # slice_start, slice_end = 523264, 525312
+            slice_start, slice_end = 270336, 272384
+            logits = torch.log(X[:, :, slice_start:slice_end] + self.eps) + self.weights_0
             
+            if self.slice_index_1 is not None:
+                # slice_start_1, slice_end_1 = 13312, 13824
+                slice_start_1, slice_end_1 = 628736, 630784
+                logits_1 = torch.log(X[:, :, slice_start_1:slice_end_1] + self.eps) + self.weights_1
+        
+        # logits = torch.log(X + self.eps) + self.weights_0
+        
         # Expand X to create batch_size copies
         X_expanded = X.expand(self.batch_size, *X.shape[1:])
         
         logits = logits.expand(self.batch_size, -1, -1)
         edited_slice = torch.nn.functional.gumbel_softmax(logits, tau=self.tau, hard=True, dim=1)
 
+        if self.slice_index_1 is not None:
+            logits_1 = logits_1.expand(self.batch_size, -1, -1)
+            edited_slice_1 = torch.nn.functional.gumbel_softmax(logits_1, tau=self.tau, hard=True, dim=1)
+        
         # Create a batch of modified sequences
         X_hat = X_expanded.clone()
         
@@ -235,8 +254,14 @@ class Ledidi(torch.nn.Module):
             X_hat = edited_slice  # Replace the slice in all copies
         else:
             # slice_start, slice_end = 10752, 11264
-            slice_start, slice_end = 523264, 525312
+            # slice_start, slice_end = 523264, 525312
+            slice_start, slice_end = 270336, 272384
             X_hat[:, :, slice_start:slice_end] = edited_slice
+            
+            if self.slice_index_1 is not None:
+                # slice_start_1, slice_end_1 = 13312, 13824 
+                slice_start_1, slice_end_1 = 628736, 630784 
+                X_hat[:, :, slice_start_1:slice_end_1] = edited_slice_1
             
         return X_hat
         
@@ -272,7 +297,11 @@ class Ledidi(torch.nn.Module):
             passed in.
         """
         
-        optimizer = torch.optim.AdamW((self.weights,), lr=self.lr)
+        optimizer = torch.optim.AdamW((self.weights_0,), lr=self.lr)
+        
+        if self.slice_index_1 is not None:
+            optimizer_1 = torch.optim.AdamW((self.weights_1,), lr=self.lr)
+        
         history = {'edits': [], 'input_loss': [], 'output_loss': [], 
             'total_loss': [], 'batch_size': self.batch_size}
         
@@ -292,25 +321,30 @@ class Ledidi(torch.nn.Module):
         
         n_iter_wo_improvement = 0
         
-        # temp: LOCAL LOSS - flame indices
-        # loaded_indices = np.load("/home1/smaruj/ledidi_akita/fragment_indices.npy")
-        # loaded_indices = torch.tensor(loaded_indices, dtype=torch.long, device=y_hat.device)
+        # temp: LOCAL LOSS - selected indices
+        loaded_indices = np.load("/home1/smaruj/ledidi_akita/fragment_indices.npy")
+        loaded_indices = torch.tensor(loaded_indices, dtype=torch.long, device=y_hat.device)
         
-        # # Index the last dimension
-        # y_hat_selected = y_hat[..., loaded_indices]  # Shape: (1, 5, 4414)
-        # y_bar_selected = y_bar[..., loaded_indices]
+        # Index the last dimension
+        y_hat_selected = y_hat[..., loaded_indices]
+        y_bar_selected = y_bar[..., loaded_indices]
         
-        # output_loss = self.output_loss(y_hat_selected, y_bar_selected).item() * 10**7
+        output_loss = self.output_loss(y_hat_selected, y_bar_selected).item() * 2768
         
         # loss between the prediction of the original sequence
-        # and the desired prediction (aka starting loss)      
-        output_loss = self.output_loss(y_hat, y_bar).item() * 10**7
-
+        # and the desired prediction (aka starting loss)  
+        # MSE_scaling_factor = 10**7
+        # output_loss = self.output_loss(y_hat, y_bar).item() * MSE_scaling_factor
+        # output_loss = self.output_loss(y_hat, y_bar).item()
+        
         best_input_loss = 0.0
         best_output_loss = output_loss
         best_total_loss = output_loss
         best_sequence = X
-        best_weights = torch.clone(self.weights)
+        best_weights_0 = torch.clone(self.weights_0)
+        
+        if self.slice_index_1 is not None:
+            best_weights_1 = torch.clone(self.weights_1)
         
         # X_ is the original sequence expanded to the batch size
         X_ = X.repeat(self.batch_size, 1, 1)
@@ -349,12 +383,13 @@ class Ledidi(torch.nn.Module):
             input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
                 
             # output_loss avraged over batch_size
-            output_loss = self.output_loss(y_hat, y_bar) * 10**7
+            # output_loss = self.output_loss(y_hat, y_bar)
+            # output_loss = self.output_loss(y_hat, y_bar) * MSE_scaling_factor
             
             # LOCAL LOSS
-            # y_hat_selected = y_hat[..., loaded_indices]  # Shape: (1, 5, 4414)
-            # y_bar_selected = y_bar[..., loaded_indices]
-            # output_loss = self.output_loss(y_hat_selected, y_bar_selected) * 10**7
+            y_hat_selected = y_hat[..., loaded_indices]
+            y_bar_selected = y_bar[..., loaded_indices]
+            output_loss = self.output_loss(y_hat_selected, y_bar_selected) * 2768
             
             output_loss = output_loss / self.batch_size
             
@@ -363,13 +398,20 @@ class Ledidi(torch.nn.Module):
             # BACKWARD PASS
             # gradient calculation and weights update
             optimizer.zero_grad()
+            
+            if self.slice_index_1 is not None:
+                optimizer_1.zero_grad()
+            
             total_loss.backward(retain_graph=True)
             
             # grad_norm = self.weights.grad.norm()
             # print(f"Gradient magnitude: {grad_norm.item()}")
             
             optimizer.step()
-
+            
+            if self.slice_index_1 is not None:
+                optimizer_1.step()
+                
             input_loss = input_loss.item()
             output_loss = output_loss.item()
             total_loss = total_loss.item()
@@ -393,8 +435,11 @@ class Ledidi(torch.nn.Module):
                 best_total_loss = total_loss
 
                 best_sequence = torch.clone(X_hat)
-                best_weights = torch.clone(self.weights)
+                best_weights_0 = torch.clone(self.weights_0)
 
+                if self.slice_index_1 is not None:
+                    best_weights_1 = torch.clone(self.weights_1)
+                
                 n_iter_wo_improvement = 0
             else:
                 n_iter_wo_improvement += 1
@@ -402,8 +447,12 @@ class Ledidi(torch.nn.Module):
                     break
 
         optimizer.zero_grad()
-        self.weights = torch.nn.Parameter(best_weights)
+        self.weights_0 = torch.nn.Parameter(best_weights_0)
 
+        if self.slice_index_1 is not None:
+            optimizer_1.zero_grad()
+            self.weights_1 = torch.nn.Parameter(best_weights_1)
+        
         if self.verbose:
             print(("iter=F\tinput_loss={:4.4}\toutput_loss={:4.4}\t" +
                 "total_loss={:4.4}\ttime={:4.4}").format(best_input_loss, 
