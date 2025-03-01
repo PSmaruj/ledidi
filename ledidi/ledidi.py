@@ -6,18 +6,9 @@ import time
 import torch
 
 import sys
-# from semifreddo_model import Semifreddo
-from semifreddo_full_model import Semifreddo
-
 import numpy as np
 
-
-def check_memory(tag=""):
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # Convert to MB
-        reserved = torch.cuda.memory_reserved() / (1024 ** 2)  # Convert to MB
-        print(f"[{tag}] Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB")
-
+from semifreddo_full_model import Semifreddo
 
 class DesignWrapper(torch.nn.Module):
     """A wrapper for using multiple models in design.
@@ -140,14 +131,28 @@ class Ledidi(torch.nn.Module):
         Whether to print the loss during design. Default is True.
     """
 
-    def __init__(self, model, target=None, 
+    def __init__(self, 
+                 model, 
                  input_loss=torch.nn.L1Loss(reduction='sum'), 
                  output_loss=torch.nn.MSELoss(), 
-                 tau=1, l=0.1, 
-                 batch_size=10, max_iter=1000, early_stopping_iter=100, report_iter=100, lr=1.0, eps=1e-4, 
-                 return_history=False, verbose=True, 
-                 num_channels = 4, slice_length=2048, slice_index_0=21, slice_index_1=None,
-                 use_semifreddo=True, saved_tmp_out="/scratch1/smaruj/ledidi_targets/full_tower_out.pt"):
+                 tau=1, 
+                 l=0.1, 
+                 lr=1.0, 
+                 eps=1e-4, 
+                 batch_size=10, 
+                 max_iter=1000, 
+                 early_stopping_iter=100, 
+                 report_iter=100,  
+                 return_history=False, 
+                 verbose=True, 
+                 num_channels=4, 
+                 bin_size=2048, 
+                 input_mask_slices_0=[224], 
+                 input_mask_slices_1=None,
+                 cropping_applied=32,
+                 output_mask_path=None,
+                 use_semifreddo=False,
+                 semifreddo_temp_output_path=None):
         super().__init__()
         
         for param in model.parameters():
@@ -160,45 +165,47 @@ class Ledidi(torch.nn.Module):
         self.output_loss = output_loss
         self.tau = tau
         self.l = l
+        self.lr = lr
+        self.eps = eps
         self.batch_size = batch_size
         self.max_iter = max_iter
         self.early_stopping_iter = early_stopping_iter
         self.report_iter = report_iter
-        self.lr = lr
-        self.eps = eps
         self.return_history = return_history
         self.verbose = verbose
         self.num_channels = num_channels
-        self.slice_length = slice_length
-        self.slice_index_0 = slice_index_0
-        self.slice_index_1 = slice_index_1
+        self.bin_size =  bin_size
+        self.input_mask_slices_0 = input_mask_slices_0 
+        self.input_mask_slices_1 = input_mask_slices_1
+        self.cropping_applied = cropping_applied
+        self.output_mask_path = output_mask_path
         self.use_semifreddo = use_semifreddo
-        self.saved_tmp_out = saved_tmp_out
+        self.semifreddo_temp_output_path = semifreddo_temp_output_path
         
-        if target is None:
-            self.target = slice(target)
-        else:
-            self.target = slice(target, target+1)
+        self.slice_0_length = len(self.input_mask_slices_0) * self.bin_size
         
         self.weights_0 = torch.nn.Parameter(
-            torch.zeros((1, self.num_channels, self.slice_length), dtype=torch.float32, requires_grad=True)
+            torch.zeros((1, self.num_channels, self.slice_0_length), dtype=torch.float32, requires_grad=True)
         )
         
-        if self.slice_index_1 is not None:
+        # optionally, the second slice is optimized in parallel
+        if self.input_mask_slices_1 is not None:
+            self.slice_1_length = len(self.input_mask_slices_1) * self.bin_size
+            
             self.weights_1 = torch.nn.Parameter(
-                torch.zeros((1, self.num_channels, self.slice_length), dtype=torch.float32, requires_grad=True)
+                torch.zeros((1, self.num_channels, self.slice_1_length), dtype=torch.float32, requires_grad=True)
             )
         
         print("Model in train mode:", self.model.training)
         
-        print("Gradients enabled for weights:", self.weights_0.requires_grad)
-        print("Weights shape", self.weights_0.shape)
+        print("Gradients enabled for weights - slice 0:", self.weights_0.requires_grad)
+        print("Weights shape - slice 0:", self.weights_0.shape)
         
-        if self.slice_index_1 is not None:
-            print("Gradients enabled for weights 1:", self.weights_1.requires_grad)
-            print("Weights 1 shape", self.weights_1.shape)
+        if self.input_mask_slices_1 is not None:
+            print("Gradients enabled for weights - slice 1:", self.weights_1.requires_grad)
+            print("Weights shape - slice 1:", self.weights_1.shape)
         
-    def forward(self, X):
+    def forward(self, X, X1=None, padding_bins=2):
         """Generate a set of edits given a sequence.
 
         This method will take in the one-hot encoded sequence and the current
@@ -223,18 +230,25 @@ class Ledidi(torch.nn.Module):
         """        
         
         if self.use_semifreddo:
-            logits = torch.log(X + self.eps) + self.weights_0
+            padding_bp = padding_bins * self.bin_size
+            # slice 0
+            logits = torch.log(X[:, :, padding_bp:-padding_bp] + self.eps) + self.weights_0
+            # slice 1
+            if X1 is not None:
+                logits_1 = torch.log(X1[:, :, padding_bp:-padding_bp] + self.eps) + self.weights_1
         else:
-            # slice_start, slice_end = 10752, 11264
-            # slice_start, slice_end = 523264, 525312
-            slice_start, slice_end = 270336, 272384
-            logits = torch.log(X[:, :, slice_start:slice_end] + self.eps) + self.weights_0
+            start_slice = (min(self.input_mask_slices_0) + self.cropping_applied) * self.bin_size
+            end_slice = (max(self.input_mask_slices_0) + 1 + self.cropping_applied) * self.bin_size
             
-            if self.slice_index_1 is not None:
-                # slice_start_1, slice_end_1 = 13312, 13824
-                slice_start_1, slice_end_1 = 628736, 630784
-                logits_1 = torch.log(X[:, :, slice_start_1:slice_end_1] + self.eps) + self.weights_1
+            logits = torch.log(X[:, :, start_slice:end_slice] + self.eps) + self.weights_0
+            
+            if self.input_mask_slices_1 is not None:
+                start_slice_1 = (min(self.input_mask_slices_1) + self.cropping_applied) * self.bin_size
+                end_slice_1 = (max(self.input_mask_slices_1) + 1 + self.cropping_applied) * self.bin_size
+                
+                logits_1 = torch.log(X[:, :, start_slice_1:end_slice_1] + self.eps) + self.weights_1
         
+        # if we want to edit the entire seq
         # logits = torch.log(X + self.eps) + self.weights_0
         
         # Expand X to create batch_size copies
@@ -243,30 +257,40 @@ class Ledidi(torch.nn.Module):
         logits = logits.expand(self.batch_size, -1, -1)
         edited_slice = torch.nn.functional.gumbel_softmax(logits, tau=self.tau, hard=True, dim=1)
 
-        if self.slice_index_1 is not None:
-            logits_1 = logits_1.expand(self.batch_size, -1, -1)
-            edited_slice_1 = torch.nn.functional.gumbel_softmax(logits_1, tau=self.tau, hard=True, dim=1)
-        
         # Create a batch of modified sequences
         X_hat = X_expanded.clone()
         
+        if self.input_mask_slices_1 is not None:
+            X1_expanded = X1.expand(self.batch_size, *X1.shape[1:])
+            
+            logits_1 = logits_1.expand(self.batch_size, -1, -1)
+            edited_slice_1 = torch.nn.functional.gumbel_softmax(logits_1, tau=self.tau, hard=True, dim=1)
+
+            X1_hat = X1_expanded.clone()
+        
         if self.use_semifreddo:
-            X_hat = edited_slice  # Replace the slice in all copies
+            X_hat_slice_0 = X_hat.clone()
+            X_hat_slice_0[:, :, padding_bp:-padding_bp] = edited_slice
+            
+            if self.input_mask_slices_1 is  None:
+                return X_hat_slice_0
+            
+            elif X1 is not None:
+                X_hat_slice_1 = X1_hat.clone()
+                X_hat_slice_1[:, :, padding_bp:-padding_bp] = edited_slice_1
+            
+                return X_hat_slice_0, X_hat_slice_1
+            
         else:
-            # slice_start, slice_end = 10752, 11264
-            # slice_start, slice_end = 523264, 525312
-            slice_start, slice_end = 270336, 272384
-            X_hat[:, :, slice_start:slice_end] = edited_slice
+            X_hat[:, :, start_slice:end_slice] = edited_slice
             
-            if self.slice_index_1 is not None:
-                # slice_start_1, slice_end_1 = 13312, 13824 
-                slice_start_1, slice_end_1 = 628736, 630784 
-                X_hat[:, :, slice_start_1:slice_end_1] = edited_slice_1
+            if self.input_mask_slices_1 is not None:
+                X_hat[:, :, start_slice_1:end_slice_1] = edited_slice_1
             
-        return X_hat
+            return X_hat
         
 
-    def fit_transform(self, X, y_bar, X_l_flank, X_r_flank):
+    def fit_transform(self, X, y_bar, X1=None):
         """Apply the Ledidi procedure to design edits for a sequence.
 
         This procedure takes in a single sequence and a desired output from
@@ -299,7 +323,7 @@ class Ledidi(torch.nn.Module):
         
         optimizer = torch.optim.AdamW((self.weights_0,), lr=self.lr)
         
-        if self.slice_index_1 is not None:
+        if self.input_mask_slices_1 is not None:
             optimizer_1 = torch.optim.AdamW((self.weights_1,), lr=self.lr)
         
         history = {'edits': [], 'input_loss': [], 'output_loss': [], 
@@ -308,34 +332,45 @@ class Ledidi(torch.nn.Module):
         # inpainting_mask - ensures only the valid positions
         # are taken into account while input_loss is calculates
         inpainting_mask = X[0].sum(dim=0) == 1
-        
-        flanked_X = torch.cat((X_l_flank, X, X_r_flank), dim=-1)
 
+        if (self.input_mask_slices_1 is not None) and (self.use_semifreddo == True):
+            inpainting_mask_1 = X1[0].sum(dim=0) == 1
+        
         # prediction for the input sequence
         if self.use_semifreddo:
-            semifreddo_model = Semifreddo(flanked_X, self.slice_index, self.model, self.saved_tmp_out, batch_size=1)
+            semifreddo_model = Semifreddo(model=self.model,
+                                          slice_0_padded_seq=X, 
+                                          edited_indices_slice_0=self.input_mask_slices_0,
+                                          saved_temp_output_path=self.semifreddo_temp_output_path,
+                                          slice_1_padded_seq=X1,
+                                          edited_indices_slice_1=self.input_mask_slices_1,
+                                          batch_size=1)
             y_hat = semifreddo_model.forward()
         else:
-            y_hat = self.model(X)[:, self.target]
+            y_hat = self.model(X)
         y_hat = y_hat.squeeze(1)
         
         n_iter_wo_improvement = 0
         
-        # temp: LOCAL LOSS - selected indices
-        loaded_indices = np.load("/home1/smaruj/ledidi_akita/fragment_indices.npy")
-        loaded_indices = torch.tensor(loaded_indices, dtype=torch.long, device=y_hat.device)
-        
-        # Index the last dimension
-        y_hat_selected = y_hat[..., loaded_indices]
-        y_bar_selected = y_bar[..., loaded_indices]
-        
-        output_loss = self.output_loss(y_hat_selected, y_bar_selected).item() * 2768
-        
         # loss between the prediction of the original sequence
         # and the desired prediction (aka starting loss)  
-        # MSE_scaling_factor = 10**7
-        # output_loss = self.output_loss(y_hat, y_bar).item() * MSE_scaling_factor
-        # output_loss = self.output_loss(y_hat, y_bar).item()
+        if self.output_mask_path is not None:
+            # LOCAL LOSS
+            print("Local loss applied.")
+            loaded_unmask_indices = torch.load(self.output_mask_path, weights_only=True)
+            loaded_unmask_indices = loaded_unmask_indices.to(dtype=torch.long, device=y_hat.device)
+            
+            y_hat_unmasked = y_hat[..., loaded_unmask_indices]
+            y_bar_unmasked = y_bar[..., loaded_unmask_indices]
+            
+            scaling_factor = y_hat.shape[-1] // y_hat_unmasked.shape[-1]
+            
+            output_loss = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
+        
+        else:
+            # GLOBAL LOSS
+            print("Global loss applied.")
+            output_loss = self.output_loss(y_hat, y_bar)
         
         best_input_loss = 0.0
         best_output_loss = output_loss
@@ -343,11 +378,14 @@ class Ledidi(torch.nn.Module):
         best_sequence = X
         best_weights_0 = torch.clone(self.weights_0)
         
-        if self.slice_index_1 is not None:
+        if self.input_mask_slices_1 is not None:
             best_weights_1 = torch.clone(self.weights_1)
         
         # X_ is the original sequence expanded to the batch size
         X_ = X.repeat(self.batch_size, 1, 1)
+        
+        if X1 is not None:
+            X_1 = X1.repeat(self.batch_size, 1, 1)
         
         # Ensure y_bar has shape (batch_size, num_targets, vector_len)
         if y_bar.dim() == 2:
@@ -361,36 +399,60 @@ class Ledidi(torch.nn.Module):
             print(("iter=I\tinput_loss=0.0\toutput_loss={:4.4}\t" +
                 "total_loss={:4.4}\ttime=0.0").format(output_loss, 
                     best_total_loss))
-
-        # Expandinf flanking sequences
-        X_l_flank_batch = X_l_flank.repeat(self.batch_size, 1, 1)
-        X_r_flank_batch = X_r_flank.repeat(self.batch_size, 1, 1)
         
         for i in range(1, self.max_iter+1):
             # generating new sequence -> FORWARD PASS
-            X_hat = self(X)
             
             # prediction for the new sequence
             if self.use_semifreddo:
-                flanked_X_hat = torch.cat((X_l_flank_batch, X_hat, X_r_flank_batch), dim=-1)
                 
-                semifreddo_model = Semifreddo(flanked_X_hat, self.slice_index, self.model, self.saved_tmp_out, batch_size=self.batch_size)
-                y_hat = semifreddo_model.forward()
+                if X1 is None:
+                
+                    X_hat = self(X)
+                                        
+                    semifreddo_model = Semifreddo(model=self.model,
+                                    slice_0_padded_seq=X_hat, 
+                                    edited_indices_slice_0=self.input_mask_slices_0,
+                                    saved_temp_output_path=self.semifreddo_temp_output_path,
+                                    slice_1_padded_seq=None,
+                                    edited_indices_slice_1=self.input_mask_slices_1,
+                                    batch_size=self.batch_size)
+                    y_hat = semifreddo_model.forward()
+                
+                else:
+                    X_hat, X1_hat = self(X, X1)
+                
+                    semifreddo_model = Semifreddo(model=self.model,
+                                    slice_0_padded_seq=X_hat, 
+                                    edited_indices_slice_0=self.input_mask_slices_0,
+                                    saved_temp_output_path=self.semifreddo_temp_output_path,
+                                    slice_1_padded_seq=X1_hat,
+                                    edited_indices_slice_1=self.input_mask_slices_1,
+                                    batch_size=self.batch_size)
+                    y_hat = semifreddo_model.forward()
+                
             else:
-                y_hat = self.model(X_hat)[:, self.target]
-          
+                X_hat = self(X)
+                y_hat = self.model(X_hat)
+            
             # loss between the new and original sequence
-            input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
-                
-            # output_loss avraged over batch_size
-            # output_loss = self.output_loss(y_hat, y_bar)
-            # output_loss = self.output_loss(y_hat, y_bar) * MSE_scaling_factor
+            if X1 is not None:
+                input_loss_slice_1 = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
+                input_loss_slice_2 = self.input_loss(X1_hat[:, :, inpainting_mask_1], X_1[:, :, inpainting_mask_1]) / (self.batch_size * 2)
+                input_loss = input_loss_slice_1 + input_loss_slice_2
+            else:
+                input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
+              
+            if self.output_mask_path is not None:
+                # LOCAL LOSS                
+                y_hat_unmasked = y_hat[..., loaded_unmask_indices]  
+                y_bar_unmasked = y_bar[..., loaded_unmask_indices]              
+                output_loss = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
+            else:
+                # GLOBAL LOSS
+                output_loss = self.output_loss(y_hat, y_bar)
             
-            # LOCAL LOSS
-            y_hat_selected = y_hat[..., loaded_indices]
-            y_bar_selected = y_bar[..., loaded_indices]
-            output_loss = self.output_loss(y_hat_selected, y_bar_selected) * 2768
-            
+            # output_loss averaged over batch size
             output_loss = output_loss / self.batch_size
             
             total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
@@ -399,21 +461,18 @@ class Ledidi(torch.nn.Module):
             # gradient calculation and weights update
             optimizer.zero_grad()
             
-            if self.slice_index_1 is not None:
+            if self.input_mask_slices_1 is not None:
                 optimizer_1.zero_grad()
             
-            total_loss.backward(retain_graph=True)
-            
-            # grad_norm = self.weights.grad.norm()
-            # print(f"Gradient magnitude: {grad_norm.item()}")
+            total_loss.backward(retain_graph=True)                                    
             
             optimizer.step()
             
-            if self.slice_index_1 is not None:
+            if self.input_mask_slices_1 is not None:
                 optimizer_1.step()
-                
-            input_loss = input_loss.item()
+            
             output_loss = output_loss.item()
+            input_loss = input_loss.item()
             total_loss = total_loss.item()
             
             if self.verbose and i % self.report_iter == 0:
@@ -437,8 +496,11 @@ class Ledidi(torch.nn.Module):
                 best_sequence = torch.clone(X_hat)
                 best_weights_0 = torch.clone(self.weights_0)
 
-                if self.slice_index_1 is not None:
+                if self.input_mask_slices_1 is not None:
                     best_weights_1 = torch.clone(self.weights_1)
+                
+                if X1 is not None:
+                    best_sequence_1 = torch.clone(X1_hat)
                 
                 n_iter_wo_improvement = 0
             else:
@@ -449,7 +511,7 @@ class Ledidi(torch.nn.Module):
         optimizer.zero_grad()
         self.weights_0 = torch.nn.Parameter(best_weights_0)
 
-        if self.slice_index_1 is not None:
+        if self.input_mask_slices_1 is not None:
             optimizer_1.zero_grad()
             self.weights_1 = torch.nn.Parameter(best_weights_1)
         
@@ -460,6 +522,9 @@ class Ledidi(torch.nn.Module):
                     time.time() - initial_tic))
         
         if self.return_history:
-            return best_sequence, history
-        
-        return best_sequence
+            if X1 is not None:
+                return best_sequence, best_sequence_1, history
+            else:
+                return best_sequence, history
+        else:
+            return best_sequence

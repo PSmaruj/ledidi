@@ -9,34 +9,62 @@ def check_memory(tag=""):
 
 
 class Semifreddo():
-    def __init__(self, sequence, edited_index, model, saved_out_path, batch_size):
-        self.sequence = sequence
-        self.edited_index = edited_index
+    def __init__(self, 
+                 model,
+                 slice_0_padded_seq, 
+                 edited_indices_slice_0,
+                 saved_temp_output_path, 
+                 slice_1_padded_seq=None,
+                 edited_indices_slice_1=None,
+                 batch_size=1
+                 ):
         
         # model in interference mode
         self.model = model.eval()
         
-        self.saved_out_path = saved_out_path
+        self.slice_0_padded_seq = slice_0_padded_seq
+        self.slice_1_padded_seq = slice_1_padded_seq
+        self.edited_indices_slice_0 = edited_indices_slice_0
+        self.edited_indices_slice_1 = edited_indices_slice_1
+        self.saved_temp_output_path = saved_temp_output_path
         self.batch_size = batch_size
-    
+
+
     def forward(self):    
         
         self.model = self.model.eval()
         
-        #passing an edited sequence though the top of model
-        sub_x = self.model.conv_block_1(self.sequence)
-        sub_x = self.model.conv_tower(sub_x)
-
+        # SLICE 0
+        # passing an edited sequence though the top of model
+        sub_x_0 = self.model.conv_block_1(self.slice_0_padded_seq)
+        sub_x_0 = self.model.conv_tower(sub_x_0)
+        
+        # SLICE 1
+        if self.slice_1_padded_seq is not None:
+            sub_x_1 = self.model.conv_block_1(self.slice_1_padded_seq)
+            sub_x_1 = self.model.conv_tower(sub_x_1)
+        
         # loading saved output (for one sequence)
-        x = torch.load(self.saved_out_path, weights_only=True)
+        x = torch.load(self.saved_temp_output_path, weights_only=True)
         x = x.clone()  # Clone it to avoid modifying the original tensor
 
         if self.batch_size > 1:
             x = x.repeat(self.batch_size, 1, 1)
         
-        # x[:, :, self.edited_index] = sub_x[:,:,2].squeeze(-1) #2 becaise, there are 5 bins, we need the middle one
-        # for now, 3 bins get updated
-        x[:, :, self.edited_index-1:self.edited_index+1] = sub_x[:,:,1:3].squeeze(-1)
+        # slice 0
+        edited_slice_0_start = min(self.edited_indices_slice_0)
+        edited_slice_0_end = max(self.edited_indices_slice_0)
+        
+        # replacing +-1 bin
+        x[:, :, edited_slice_0_start-1:edited_slice_0_end+1] = sub_x_0[:,:,1:-2].squeeze(-1)
+        
+        # slice 1
+        if self.slice_1_padded_seq is not None:
+            edited_slice_1_start = min(self.edited_indices_slice_1)
+            edited_slice_1_end = max(self.edited_indices_slice_1)
+
+            # replacing +-1 bin
+            x[:, :, edited_slice_1_start-1:edited_slice_1_end+1] = sub_x_1[:,:,1:-2].squeeze(-1)
         
         x = self.model.residual1d_block1(x)
         x = self.model.residual1d_block2(x) 
