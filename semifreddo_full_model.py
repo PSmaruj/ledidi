@@ -16,7 +16,8 @@ class Semifreddo():
                  saved_temp_output_path, 
                  slice_1_padded_seq=None,
                  edited_indices_slice_1=None,
-                 batch_size=1
+                 batch_size=1,
+                 cropping_applied=32
                  ):
         
         # model in interference mode
@@ -28,6 +29,7 @@ class Semifreddo():
         self.edited_indices_slice_1 = edited_indices_slice_1
         self.saved_temp_output_path = saved_temp_output_path
         self.batch_size = batch_size
+        self.cropping_applied = cropping_applied
 
 
     def forward(self):    
@@ -52,19 +54,19 @@ class Semifreddo():
             x = x.repeat(self.batch_size, 1, 1)
         
         # slice 0
-        edited_slice_0_start = min(self.edited_indices_slice_0)
-        edited_slice_0_end = max(self.edited_indices_slice_0)
+        edited_slice_0_start = min(self.edited_indices_slice_0) + self.cropping_applied
+        edited_slice_0_end = max(self.edited_indices_slice_0) + self.cropping_applied 
         
-        # replacing +-1 bin
-        x[:, :, edited_slice_0_start-1:edited_slice_0_end+1] = sub_x_0[:,:,1:-2].squeeze(-1)
+        # replacing +-1 bin       
+        x[:, :, edited_slice_0_start-1:edited_slice_0_end+2] = sub_x_0[:,:,1:-1].squeeze(-1)
         
         # slice 1
         if self.slice_1_padded_seq is not None:
-            edited_slice_1_start = min(self.edited_indices_slice_1)
-            edited_slice_1_end = max(self.edited_indices_slice_1)
+            edited_slice_1_start = min(self.edited_indices_slice_1) + self.cropping_applied
+            edited_slice_1_end = max(self.edited_indices_slice_1) + self.cropping_applied
 
             # replacing +-1 bin
-            x[:, :, edited_slice_1_start-1:edited_slice_1_end+1] = sub_x_1[:,:,1:-2].squeeze(-1)
+            x[:, :, edited_slice_1_start-1:edited_slice_1_end+2] = sub_x_1[:,:,1:-1].squeeze(-1)
         
         x = self.model.residual1d_block1(x)
         x = self.model.residual1d_block2(x) 

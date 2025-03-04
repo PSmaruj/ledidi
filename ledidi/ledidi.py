@@ -204,6 +204,7 @@ class Ledidi(torch.nn.Module):
         if self.input_mask_slices_1 is not None:
             print("Gradients enabled for weights - slice 1:", self.weights_1.requires_grad)
             print("Weights shape - slice 1:", self.weights_1.shape)
+
         
     def forward(self, X, X1=None, padding_bins=2):
         """Generate a set of edits given a sequence.
@@ -260,13 +261,13 @@ class Ledidi(torch.nn.Module):
         # Create a batch of modified sequences
         X_hat = X_expanded.clone()
         
-        if self.input_mask_slices_1 is not None:
-            X1_expanded = X1.expand(self.batch_size, *X1.shape[1:])
-            
+        if self.input_mask_slices_1 is not None:            
             logits_1 = logits_1.expand(self.batch_size, -1, -1)
             edited_slice_1 = torch.nn.functional.gumbel_softmax(logits_1, tau=self.tau, hard=True, dim=1)
 
-            X1_hat = X1_expanded.clone()
+            if X1 is not None:
+                X1_expanded = X1.expand(self.batch_size, *X1.shape[1:])
+                X1_hat = X1_expanded.clone()
         
         if self.use_semifreddo:
             X_hat_slice_0 = X_hat.clone()
@@ -344,7 +345,8 @@ class Ledidi(torch.nn.Module):
                                           saved_temp_output_path=self.semifreddo_temp_output_path,
                                           slice_1_padded_seq=X1,
                                           edited_indices_slice_1=self.input_mask_slices_1,
-                                          batch_size=1)
+                                          batch_size=1,
+                                          cropping_applied=self.cropping_applied)
             y_hat = semifreddo_model.forward()
         else:
             y_hat = self.model(X)
@@ -416,7 +418,8 @@ class Ledidi(torch.nn.Module):
                                     saved_temp_output_path=self.semifreddo_temp_output_path,
                                     slice_1_padded_seq=None,
                                     edited_indices_slice_1=self.input_mask_slices_1,
-                                    batch_size=self.batch_size)
+                                    batch_size=self.batch_size,
+                                    cropping_applied=self.cropping_applied)
                     y_hat = semifreddo_model.forward()
                 
                 else:
@@ -428,7 +431,8 @@ class Ledidi(torch.nn.Module):
                                     saved_temp_output_path=self.semifreddo_temp_output_path,
                                     slice_1_padded_seq=X1_hat,
                                     edited_indices_slice_1=self.input_mask_slices_1,
-                                    batch_size=self.batch_size)
+                                    batch_size=self.batch_size,
+                                    cropping_applied=self.cropping_applied)
                     y_hat = semifreddo_model.forward()
                 
             else:
