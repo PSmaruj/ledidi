@@ -9,6 +9,9 @@ import sys
 import numpy as np
 
 from semifreddo_full_model import Semifreddo
+from ledidi.gc_calculation import gc_content
+from ledidi.pwm_score import read_meme_pwm, pwm_max_score
+
 
 class DesignWrapper(torch.nn.Module):
     """A wrapper for using multiple models in design.
@@ -152,7 +155,9 @@ class Ledidi(torch.nn.Module):
                  cropping_applied=32,
                  output_mask_path=None,
                  use_semifreddo=False,
-                 semifreddo_temp_output_path=None):
+                 semifreddo_temp_output_path=None,
+                 punish_ctcf=False,
+                 ctcf_meme_path=None):
         super().__init__()
         
         for param in model.parameters():
@@ -181,6 +186,16 @@ class Ledidi(torch.nn.Module):
         self.output_mask_path = output_mask_path
         self.use_semifreddo = use_semifreddo
         self.semifreddo_temp_output_path = semifreddo_temp_output_path
+        self.punish_ctcf = punish_ctcf
+        self.ctcf_meme_path = ctcf_meme_path
+        
+        if (self.punish_ctcf == True) and (self.ctcf_meme_path is None):
+            print("Please, provide a path to the CTCF motif in the meme format.")
+        
+        if self.ctcf_meme_path is not None:
+            self.ctcf_pwm = read_meme_pwm(self.ctcf_meme_path)
+        else:
+            self.ctcf_pwm = None
         
         self.slice_0_length = len(self.input_mask_slices_0) * self.bin_size
         
@@ -327,8 +342,15 @@ class Ledidi(torch.nn.Module):
         if self.input_mask_slices_1 is not None:
             optimizer_1 = torch.optim.AdamW((self.weights_1,), lr=self.lr)
         
-        history = {'edits': [], 'input_loss': [], 'output_loss': [], 
-            'total_loss': [], 'batch_size': self.batch_size}
+        # history = {'edits': [], 'input_loss': [], 'output_loss': [], 
+        #     'total_loss': [], 'batch_size': self.batch_size}
+
+        if self.ctcf_meme_path is None:
+            history = {'input_loss': [], 'output_loss': [], 
+                'total_loss': [], 'gc_content': [], 'batch_size': self.batch_size}
+        else:
+            history = {'input_loss': [], 'output_loss': [], 
+                'total_loss': [], 'gc_content': [], 'ctcf_pwm_score': [], 'batch_size': self.batch_size}
         
         # inpainting_mask - ensures only the valid positions
         # are taken into account while input_loss is calculates
@@ -424,7 +446,7 @@ class Ledidi(torch.nn.Module):
                 
                 else:
                     X_hat, X1_hat = self(X, X1)
-                
+                    
                     semifreddo_model = Semifreddo(model=self.model,
                                     slice_0_padded_seq=X_hat, 
                                     edited_indices_slice_0=self.input_mask_slices_0,
@@ -459,7 +481,28 @@ class Ledidi(torch.nn.Module):
             # output_loss averaged over batch size
             output_loss = output_loss / self.batch_size
             
-            total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
+            # pwm_CTCFflanks = np.load("/home1/smaruj/IterativeMutagenesis/PWM_with_flanks.npy")
+            # pwm_CTCFflanks_tensor = torch.from_numpy(pwm_CTCFflanks).float()
+            
+            # left_flank_score = pwm_max_score(pwm_CTCFflanks_tensor[:15,:], X_hat)
+            # right_flank_score = pwm_max_score(pwm_CTCFflanks_tensor[-15:,:], X_hat)
+            
+            # pwm_score = left_flank_score + right_flank_score
+            
+            # if self.ctcf_meme_path is not None:
+            #     if X1 is not None:
+            #         pwm_score = max(pwm_max_score(self.ctcf_pwm, X_hat), pwm_max_score(self.ctcf_pwm, X1_hat))
+            #     else:
+            #         pwm_score = pwm_max_score(self.ctcf_pwm, X_hat)
+            
+            if self.punish_ctcf:
+                
+                threshold = 12.0 # strong CTCF site
+                gamma = 1000000.0
+                ctcf_penalty = max(0, pwm_score - threshold)
+                total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss + gamma * ctcf_penalty
+            else:
+                total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
             
             # BACKWARD PASS
             # gradient calculation and weights update
@@ -485,13 +528,22 @@ class Ledidi(torch.nn.Module):
                         output_loss, total_loss, time.time() - tic))
             
                 tic = time.time()               
-
+            
             if self.return_history:
-                history['edits'].append(torch.where(X_hat != X_))
+                # history['edits'].append(torch.where(X_hat != X_)) # plotting needs to be fixed for the full model
                 history['input_loss'].append(input_loss)
                 history['output_loss'].append(output_loss)
                 history['total_loss'].append(total_loss)
+                
+                if X1 is not None:
+                    gc_cont = (gc_content(X_hat) + gc_content(X1_hat)) / 2
+                else:
+                    gc_cont = gc_content(X_hat)
+                history['gc_content'].append(gc_cont)
 
+                if self.ctcf_meme_path is not None:
+                    history['ctcf_pwm_score'].append(pwm_score)
+                
             if total_loss < best_total_loss:
                 best_input_loss = input_loss
                 best_output_loss = output_loss

@@ -50,7 +50,7 @@ class Semifreddo():
         x = torch.load(self.saved_temp_output_path, weights_only=True)
         x = x.clone()  # Clone it to avoid modifying the original tensor
 
-        if self.batch_size > 1:
+        if x.shape[0] != self.batch_size:
             x = x.repeat(self.batch_size, 1, 1)
         
         # slice 0
