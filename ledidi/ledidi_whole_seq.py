@@ -9,10 +9,8 @@ import sys
 import numpy as np
 
 # from semifreddo_full_model import Semifreddo
-from semifreddo_full_v2_model import Semifreddo
-from ledidi.gc_calculation import gc_content
-from ledidi.pwm_score import read_meme_pwm_as_numpy
-from tangermeme.tools import fimo
+# from ledidi.pwm_score import read_meme_pwm_as_numpy
+# from tangermeme.tools import fimo
 
 
 class DesignWrapper(torch.nn.Module):
@@ -150,14 +148,9 @@ class Ledidi(torch.nn.Module):
                  report_iter=100,  
                  return_history=False, 
                  verbose=True, 
+                 seq_length=1310720,
                  num_channels=4, 
                  bin_size=2048, 
-                 input_mask_slices_0=[224], 
-                 input_mask_slices_1=None,
-                 cropping_applied=32,
-                 output_mask_path=None,
-                 use_semifreddo=False,
-                 semifreddo_temp_output_path=None,
                  punish_ctcf=False,
                  ctcf_meme_path=None):
         super().__init__()
@@ -180,14 +173,9 @@ class Ledidi(torch.nn.Module):
         self.report_iter = report_iter
         self.return_history = return_history
         self.verbose = verbose
+        self.seq_length = seq_length
         self.num_channels = num_channels
         self.bin_size =  bin_size
-        self.input_mask_slices_0 = input_mask_slices_0 
-        self.input_mask_slices_1 = input_mask_slices_1
-        self.cropping_applied = cropping_applied
-        self.output_mask_path = output_mask_path
-        self.use_semifreddo = use_semifreddo
-        self.semifreddo_temp_output_path = semifreddo_temp_output_path
         self.punish_ctcf = punish_ctcf
         self.ctcf_meme_path = ctcf_meme_path
         
@@ -199,31 +187,17 @@ class Ledidi(torch.nn.Module):
         else:
             self.ctcf_pwm = None
         
-        self.slice_0_length = len(self.input_mask_slices_0) * self.bin_size
-        
-        self.weights_0 = torch.nn.Parameter(
-            torch.zeros((1, self.num_channels, self.slice_0_length), dtype=torch.float32, requires_grad=True)
+        self.weights = torch.nn.Parameter(
+            torch.zeros((1, self.num_channels, self.seq_length), dtype=torch.float32, requires_grad=True)
         )
-        
-        # optionally, the second slice is optimized in parallel
-        if self.input_mask_slices_1 is not None:
-            self.slice_1_length = len(self.input_mask_slices_1) * self.bin_size
-            
-            self.weights_1 = torch.nn.Parameter(
-                torch.zeros((1, self.num_channels, self.slice_1_length), dtype=torch.float32, requires_grad=True)
-            )
         
         print("Model in train mode:", self.model.training)
         
-        print("Gradients enabled for weights - slice 0:", self.weights_0.requires_grad)
-        print("Weights shape - slice 0:", self.weights_0.shape)
-        
-        if self.input_mask_slices_1 is not None:
-            print("Gradients enabled for weights - slice 1:", self.weights_1.requires_grad)
-            print("Weights shape - slice 1:", self.weights_1.shape)
+        print("Gradients enabled for weights:", self.weights.requires_grad)
+        print("Weights shape:", self.weights.shape)
 
         
-    def forward(self, X, X1=None, padding_bins=2):
+    def forward(self, X):
         """Generate a set of edits given a sequence.
 
         This method will take in the one-hot encoded sequence and the current
@@ -247,68 +221,15 @@ class Ledidi(torch.nn.Module):
             passed in. 
         """        
         
-        if self.use_semifreddo:
-            padding_bp = padding_bins * self.bin_size
-            # slice 0
-            logits = torch.log(X[:, :, padding_bp:-padding_bp] + self.eps) + self.weights_0
-            # slice 1
-            if X1 is not None:
-                logits_1 = torch.log(X1[:, :, padding_bp:-padding_bp] + self.eps) + self.weights_1
-        else:
-            start_slice = (min(self.input_mask_slices_0) + self.cropping_applied) * self.bin_size
-            end_slice = (max(self.input_mask_slices_0) + 1 + self.cropping_applied) * self.bin_size
-            
-            logits = torch.log(X[:, :, start_slice:end_slice] + self.eps) + self.weights_0
-            
-            if self.input_mask_slices_1 is not None:
-                start_slice_1 = (min(self.input_mask_slices_1) + self.cropping_applied) * self.bin_size
-                end_slice_1 = (max(self.input_mask_slices_1) + 1 + self.cropping_applied) * self.bin_size
-                
-                logits_1 = torch.log(X[:, :, start_slice_1:end_slice_1] + self.eps) + self.weights_1
-        
         # if we want to edit the entire seq
-        # logits = torch.log(X + self.eps) + self.weights_0
-        
-        # Expand X to create batch_size copies
-        X_expanded = X.expand(self.batch_size, *X.shape[1:])
+        logits = torch.log(X + self.eps) + self.weights
         
         logits = logits.expand(self.batch_size, -1, -1)
-        edited_slice = torch.nn.functional.gumbel_softmax(logits, tau=self.tau, hard=True, dim=1)
+        edited = torch.nn.functional.gumbel_softmax(logits, tau=self.tau, hard=True, dim=1)
+        return edited 
 
-        # Create a batch of modified sequences
-        X_hat = X_expanded.clone()
-        
-        if self.input_mask_slices_1 is not None:            
-            logits_1 = logits_1.expand(self.batch_size, -1, -1)
-            edited_slice_1 = torch.nn.functional.gumbel_softmax(logits_1, tau=self.tau, hard=True, dim=1)
 
-            if X1 is not None:
-                X1_expanded = X1.expand(self.batch_size, *X1.shape[1:])
-                X1_hat = X1_expanded.clone()
-        
-        if self.use_semifreddo:
-            X_hat_slice_0 = X_hat.clone()
-            X_hat_slice_0[:, :, padding_bp:-padding_bp] = edited_slice
-            
-            if self.input_mask_slices_1 is  None:
-                return X_hat_slice_0
-            
-            elif X1 is not None:
-                X_hat_slice_1 = X1_hat.clone()
-                X_hat_slice_1[:, :, padding_bp:-padding_bp] = edited_slice_1
-            
-                return X_hat_slice_0, X_hat_slice_1
-            
-        else:
-            X_hat[:, :, start_slice:end_slice] = edited_slice
-            
-            if self.input_mask_slices_1 is not None:
-                X_hat[:, :, start_slice_1:end_slice_1] = edited_slice_1
-            
-            return X_hat
-        
-
-    def fit_transform(self, X, y_bar, X1=None):
+    def fit_transform(self, X, y_bar):
         """Apply the Ledidi procedure to design edits for a sequence.
 
         This procedure takes in a single sequence and a desired output from
@@ -339,91 +260,73 @@ class Ledidi(torch.nn.Module):
             passed in.
         """
         
-        optimizer = torch.optim.AdamW((self.weights_0,), lr=self.lr)
-        
-        if self.input_mask_slices_1 is not None:
-            optimizer_1 = torch.optim.AdamW((self.weights_1,), lr=self.lr)
-        
-        # history = {'edits': [], 'input_loss': [], 'output_loss': [], 
-        #     'total_loss': [], 'batch_size': self.batch_size}
+        optimizer = torch.optim.AdamW((self.weights,), lr=self.lr)
 
-        if self.ctcf_meme_path is None:
-            history = {'input_loss': [], 'output_loss': [], 
-                'total_loss': [], 'gc_content': [], 'batch_size': self.batch_size}
-        else:
-            history = {'input_loss': [], 'output_loss': [], 
-                'total_loss': [], 'gc_content': [], 'ctcf_fimo_sum_score': [], 'batch_size': self.batch_size}
+        history = {'edits': [], 'input_loss': [], 'output_loss': [], 
+            'total_loss': [], 'batch_size': self.batch_size}
+        
+        # if self.ctcf_meme_path is None:
+        #     history = {'input_loss': [], 'output_loss': [], 
+        #         'total_loss': [], 'gc_content': [], 'batch_size': self.batch_size}
+        # else:
+        #     history = {'input_loss': [], 'output_loss': [], 
+        #         'total_loss': [], 'gc_content': [], 'ctcf_fimo_sum_score': [], 'batch_size': self.batch_size}
         
         # inpainting_mask - ensures only the valid positions
         # are taken into account while input_loss is calculates
         inpainting_mask = X[0].sum(dim=0) == 1
-
-        if (self.input_mask_slices_1 is not None) and (self.use_semifreddo == True):
-            inpainting_mask_1 = X1[0].sum(dim=0) == 1
         
-        # prediction for the input sequence
-        if self.use_semifreddo:
-            semifreddo_model = Semifreddo(model=self.model,
-                                          slice_0_padded_seq=X, 
-                                          edited_indices_slice_0=self.input_mask_slices_0,
-                                          saved_temp_output_path=self.semifreddo_temp_output_path,
-                                          slice_1_padded_seq=X1,
-                                          edited_indices_slice_1=self.input_mask_slices_1,
-                                          batch_size=1,
-                                          cropping_applied=self.cropping_applied)
-            y_hat = semifreddo_model.forward()
-        else:
-            y_hat = self.model(X)
-        # y_hat = y_hat.squeeze(1)
+        y_hat = self.model(X)
         
         n_iter_wo_improvement = 0
         
         # loss between the prediction of the original sequence
         # and the desired prediction (aka starting loss)  
-        if self.output_mask_path is not None:
-            # LOCAL LOSS
-            print("Local loss applied.")
-            loaded_unmask_indices = torch.load(self.output_mask_path, weights_only=True)
-            loaded_unmask_indices = loaded_unmask_indices.to(dtype=torch.long, device=y_hat.device)
+        # if self.output_mask_path is not None:
+        #     # LOCAL LOSS
+        #     print("Local loss applied.")
+        #     loaded_unmask_indices = torch.load(self.output_mask_path, weights_only=True)
+        #     loaded_unmask_indices = loaded_unmask_indices.to(dtype=torch.long, device=y_hat.device)
             
-            y_hat_unmasked = y_hat[..., loaded_unmask_indices]
-            y_bar_unmasked = y_bar[..., loaded_unmask_indices]
+        #     y_hat_unmasked = y_hat[..., loaded_unmask_indices]
+        #     y_bar_unmasked = y_bar[..., loaded_unmask_indices]
             
-            scaling_factor = y_hat.shape[-1] // y_hat_unmasked.shape[-1]
+        #     scaling_factor = y_hat.shape[-1] // y_hat_unmasked.shape[-1]
             
-            output_loss = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
+        #     output_loss = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
             
-            # mixed loss = global loss + scaled local loss
-            # output_loss_everywhere = self.output_loss(y_hat, y_bar)
-            # local_loss_scaled = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
-            # output_loss = output_loss_everywhere + local_loss_scaled
+        #     # mixed loss = global loss + scaled local loss
+        #     # output_loss_everywhere = self.output_loss(y_hat, y_bar)
+        #     # local_loss_scaled = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
+        #     # output_loss = output_loss_everywhere + local_loss_scaled
         
-        else:
-            # GLOBAL LOSS
-            print("Global loss applied.")
-            output_loss = self.output_loss(y_hat, y_bar)
+        # else:
+        
+        print("y_hat shape", y_hat.shape)
+        print("y_bar shape", y_bar.shape)
+        
+        # GLOBAL LOSS
+        print("Global loss applied.")
+        output_loss = self.output_loss(y_hat, y_bar)
         
         best_input_loss = 0.0
         best_output_loss = output_loss
         best_total_loss = output_loss
         best_sequence = X
-        best_weights_0 = torch.clone(self.weights_0)
+        best_weights = torch.clone(self.weights)
         last_iter_update = 0
-        
-        if self.input_mask_slices_1 is not None:
-            best_weights_1 = torch.clone(self.weights_1)
         
         # X_ is the original sequence expanded to the batch size
         X_ = X.repeat(self.batch_size, 1, 1)
-        
-        if X1 is not None:
-            X_1 = X1.repeat(self.batch_size, 1, 1)
         
         # Ensure y_bar has shape (batch_size, num_targets, vector_len)
         if y_bar.dim() == 2:
             y_bar = y_bar.unsqueeze(1)
                 
         y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
+        
+        print("X_ shape", X_.shape)
+        print("y_bar shape", y_bar.shape)
         
         tic = time.time()
         initial_tic = time.time()
@@ -436,99 +339,60 @@ class Ledidi(torch.nn.Module):
             # generating new sequence -> FORWARD PASS
             
             # prediction for the new sequence
-            if self.use_semifreddo:
-                
-                if X1 is None:
-                
-                    X_hat = self(X)
-                                        
-                    semifreddo_model = Semifreddo(model=self.model,
-                                    slice_0_padded_seq=X_hat, 
-                                    edited_indices_slice_0=self.input_mask_slices_0,
-                                    saved_temp_output_path=self.semifreddo_temp_output_path,
-                                    slice_1_padded_seq=None,
-                                    edited_indices_slice_1=self.input_mask_slices_1,
-                                    batch_size=self.batch_size,
-                                    cropping_applied=self.cropping_applied)
-                    y_hat = semifreddo_model.forward()
-                
-                else:
-                    X_hat, X1_hat = self(X, X1)
-                    
-                    semifreddo_model = Semifreddo(model=self.model,
-                                    slice_0_padded_seq=X_hat, 
-                                    edited_indices_slice_0=self.input_mask_slices_0,
-                                    saved_temp_output_path=self.semifreddo_temp_output_path,
-                                    slice_1_padded_seq=X1_hat,
-                                    edited_indices_slice_1=self.input_mask_slices_1,
-                                    batch_size=self.batch_size,
-                                    cropping_applied=self.cropping_applied)
-                    y_hat = semifreddo_model.forward()
-                
-            else:
-                X_hat = self(X)
-                y_hat = self.model(X_hat)
-            
-            # loss between the new and original sequence
-            if X1 is not None:
-                input_loss_slice_1 = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
-                input_loss_slice_2 = self.input_loss(X1_hat[:, :, inpainting_mask_1], X_1[:, :, inpainting_mask_1]) / (self.batch_size * 2)
-                input_loss = input_loss_slice_1 + input_loss_slice_2
-            else:
-                input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
+            X_hat = self(X)
+            y_hat = self.model(X_hat)
               
-            if self.output_mask_path is not None:
-                # LOCAL LOSS                
-                y_hat_unmasked = y_hat[..., loaded_unmask_indices]  
-                y_bar_unmasked = y_bar[..., loaded_unmask_indices]              
-                output_loss = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
-            else:
-                # GLOBAL LOSS
-                output_loss = self.output_loss(y_hat, y_bar)
+            # if self.output_mask_path is not None:
+            #     # LOCAL LOSS                
+            #     y_hat_unmasked = y_hat[..., loaded_unmask_indices]  
+            #     y_bar_unmasked = y_bar[..., loaded_unmask_indices]              
+            #     output_loss = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
+            # else:
+            
+            input_loss = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (X_hat.shape[0] * 2)
+            
+            # GLOBAL LOSS
+            output_loss = self.output_loss(y_hat, y_bar)
             
             # output_loss averaged over batch size
             output_loss = output_loss / self.batch_size
-                       
-            if self.ctcf_meme_path is not None:
-                # pwm_CTCF = read_meme_pwm_as_numpy(self.ctcf_meme_path)
-                pwm_CTCF_tensor = torch.from_numpy(self.ctcf_pwm).float()
-                motifs_dict = {"CTCF": pwm_CTCF_tensor}
                 
-                X_hat_slice_bin = X_hat[:,:,4076:-4076]
-                X_hat_slice_bin_cpu = X_hat_slice_bin.cpu().detach().numpy()
-                # fimo score hits
-                X_hat_hits = fimo.fimo(motifs=motifs_dict, sequences=X_hat_slice_bin_cpu, threshold=1e-4, reverse_complement=True)
+            total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
+                  
+            # if self.ctcf_meme_path is not None:
+            #     # pwm_CTCF = read_meme_pwm_as_numpy(self.ctcf_meme_path)
+            #     pwm_CTCF_tensor = torch.from_numpy(self.ctcf_pwm).float()
+            #     motifs_dict = {"CTCF": pwm_CTCF_tensor}
                 
-                if X1 is not None:
-                    X1_hat_slice_bin = X1_hat[:,:,4076:-4076]
-                    X1_hat_slice_bin_cpu = X1_hat_slice_bin.cpu().detach().numpy()
-                    X1_hat_hits = fimo.fimo(motifs=motifs_dict, sequences=X1_hat_slice_bin_cpu, threshold=1e-4, reverse_complement=True)
+            #     X_hat_slice_bin = X_hat[:,:,4076:-4076]
+            #     X_hat_slice_bin_cpu = X_hat_slice_bin.cpu().detach().numpy()
+            #     # fimo score hits
+            #     X_hat_hits = fimo.fimo(motifs=motifs_dict, sequences=X_hat_slice_bin_cpu, threshold=1e-4, reverse_complement=True)
+                
+            #     if X1 is not None:
+            #         X1_hat_slice_bin = X1_hat[:,:,4076:-4076]
+            #         X1_hat_slice_bin_cpu = X1_hat_slice_bin.cpu().detach().numpy()
+            #         X1_hat_hits = fimo.fimo(motifs=motifs_dict, sequences=X1_hat_slice_bin_cpu, threshold=1e-4, reverse_complement=True)
                     
-                    score = max(X_hat_hits[0]["score"].sum(), X1_hat_hits[0]["score"].sum())
-                else:
-                    # score = X_hat_hits[0]["score"].sum()
-                    score = X_hat_hits[0]["score"].max()
+            #         score = max(X_hat_hits[0]["score"].sum(), X1_hat_hits[0]["score"].sum())
+            #     else:
+            #         # score = X_hat_hits[0]["score"].sum()
+            #         score = X_hat_hits[0]["score"].max()
                     
-            if self.punish_ctcf:
-                gamma = 650
-                # gamma=50
-                total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss + score * gamma
-            else:
-                total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
+            # if self.punish_ctcf:
+            #     gamma = 650
+            #     # gamma=50
+            #     total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss + score * gamma
+            # else:
+            #     total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
             
             # BACKWARD PASS
             # gradient calculation and weights update
             optimizer.zero_grad()
             
-            if self.input_mask_slices_1 is not None:
-                optimizer_1.zero_grad()
-            
             total_loss.backward(retain_graph=True)                                    
             
             optimizer.step()
-            
-            if self.input_mask_slices_1 is not None:
-                optimizer_1.step()
             
             output_loss = output_loss.item()
             input_loss = input_loss.item()
@@ -547,14 +411,11 @@ class Ledidi(torch.nn.Module):
                 history['output_loss'].append(output_loss)
                 history['total_loss'].append(total_loss)
                 
-                if X1 is not None:
-                    gc_cont = (gc_content(X_hat) + gc_content(X1_hat)) / 2
-                else:
-                    gc_cont = gc_content(X_hat)
-                history['gc_content'].append(gc_cont)
+                # gc_cont = gc_content(X_hat)
+                # history['gc_content'].append(gc_cont)
 
-                if self.ctcf_meme_path is not None:
-                    history['ctcf_fimo_sum_score'].append(score)
+                # if self.ctcf_meme_path is not None:
+                #     history['ctcf_fimo_sum_score'].append(score)
                 
             if total_loss < best_total_loss:
                 last_iter_update = i
@@ -563,13 +424,7 @@ class Ledidi(torch.nn.Module):
                 best_total_loss = total_loss
 
                 best_sequence = torch.clone(X_hat)
-                best_weights_0 = torch.clone(self.weights_0)
-
-                if self.input_mask_slices_1 is not None:
-                    best_weights_1 = torch.clone(self.weights_1)
-                
-                if X1 is not None:
-                    best_sequence_1 = torch.clone(X1_hat)
+                best_weights = torch.clone(self.weights)
                 
                 n_iter_wo_improvement = 0
             else:
@@ -578,11 +433,7 @@ class Ledidi(torch.nn.Module):
                     break
 
         optimizer.zero_grad()
-        self.weights_0 = torch.nn.Parameter(best_weights_0)
-
-        if self.input_mask_slices_1 is not None:
-            optimizer_1.zero_grad()
-            self.weights_1 = torch.nn.Parameter(best_weights_1)
+        self.weights = torch.nn.Parameter(best_weights)
         
         if self.verbose:
             print(("iter=F\tinput_loss={:4.4}\toutput_loss={:4.4}\t" +
@@ -591,10 +442,7 @@ class Ledidi(torch.nn.Module):
                     time.time() - initial_tic))
             print("Last iteration with update: ", last_iter_update)
         if self.return_history:
-            if X1 is not None:
-                return best_sequence, best_sequence_1, history
-            else:
-                return best_sequence, history
+            return best_sequence, history
         else:
             # return best_sequence
             return best_sequence, last_iter_update
