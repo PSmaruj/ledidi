@@ -15,6 +15,23 @@ from ledidi.pwm_score import read_meme_pwm_as_numpy
 from tangermeme.tools import fimo
 
 
+def batch_pearsonr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Computes Pearson R for batched input.
+    x, y: shape (batch_size, N)
+    Returns: shape (batch_size,)
+    """
+    x_mean = x.mean(dim=1, keepdim=True)
+    y_mean = y.mean(dim=1, keepdim=True)
+    
+    vx = x - x_mean
+    vy = y - y_mean
+    
+    numerator = torch.sum(vx * vy, dim=1)
+    denominator = torch.sqrt(torch.sum(vx ** 2, dim=1) * torch.sum(vy ** 2, dim=1)) + 1e-8
+    return numerator / denominator
+
+
 class DesignWrapper(torch.nn.Module):
     """A wrapper for using multiple models in design.
 
@@ -349,10 +366,12 @@ class Ledidi(torch.nn.Module):
 
         if self.ctcf_meme_path is None:
             history = {'input_loss': [], 'output_loss': [], 
-                'total_loss': [], 'gc_content': [], 'batch_size': self.batch_size}
+                'total_loss': [], 'gc_content': [], 'batch_size': self.batch_size,
+                'edit_positions': []}
         else:
             history = {'input_loss': [], 'output_loss': [], 
-                'total_loss': [], 'gc_content': [], 'ctcf_fimo_sum_score': [], 'batch_size': self.batch_size}
+                'total_loss': [], 'gc_content': [], 'ctcf_fimo_sum_score': [], 'batch_size': self.batch_size,
+                'edit_positions': []}
         
         # inpainting_mask - ensures only the valid positions
         # are taken into account while input_loss is calculates
@@ -377,6 +396,10 @@ class Ledidi(torch.nn.Module):
         # y_hat = y_hat.squeeze(1)
         
         n_iter_wo_improvement = 0
+        
+        # forcing all variables to float32    
+        y_hat = y_hat.float()
+        y_bar = y_bar.float()
         
         # loss between the prediction of the original sequence
         # and the desired prediction (aka starting loss)  
@@ -469,6 +492,13 @@ class Ledidi(torch.nn.Module):
                 X_hat = self(X)
                 y_hat = self.model(X_hat)
             
+            # forcing all variables to float32    
+            y_hat = y_hat.float()
+            y_bar = y_bar.float()
+            
+            X = X.float()
+            X_hat = X_hat.float()
+            
             # loss between the new and original sequence
             if X1 is not None:
                 input_loss_slice_1 = self.input_loss(X_hat[:, :, inpainting_mask], X_[:, :, inpainting_mask]) / (self.batch_size * 2)
@@ -556,6 +586,16 @@ class Ledidi(torch.nn.Module):
                 if self.ctcf_meme_path is not None:
                     history['ctcf_fimo_sum_score'].append(score)
                 
+                # Track edit positions (just for batch[0] to simplify)
+                orig_nt = torch.argmax(X[:,:,4096:-4096], dim=1)
+                edited_nt = torch.argmax(X_hat[:,:,4096:-4096], dim=1)
+                edit_mask = orig_nt[0] != edited_nt[0]
+                edit_positions = torch.nonzero(edit_mask, as_tuple=False).squeeze().tolist()
+                if isinstance(edit_positions, int):  # in case of single position
+                    edit_positions = [edit_positions]
+                edit_mask_np = edit_mask.cpu().numpy().astype(int)
+                history['edit_positions'].append(edit_mask_np.tolist())
+                
             if total_loss < best_total_loss:
                 last_iter_update = i
                 best_input_loss = input_loss
@@ -565,6 +605,22 @@ class Ledidi(torch.nn.Module):
                 best_sequence = torch.clone(X_hat)
                 best_weights_0 = torch.clone(self.weights_0)
 
+                # calculating number of edits
+                orig_nt = torch.argmax(X, dim=1)          # shape: (batch_size, seq_len)
+                best_nt = torch.argmax(X_hat, dim=1)      # shape: (batch_size, seq_len)
+
+                edit_counts = torch.sum(orig_nt != best_nt)
+                # If batch_size == 1, extract scalar
+                num_edits = edit_counts.item() if edit_counts.numel() == 1 else edit_counts.tolist()
+                
+                # PearsonR between prediction and target 
+                # Flatten from (1, 1, 130305) → (1, 130305)
+                y_hat_flat = y_hat.view(y_hat.size(0), -1)
+                y_bar_flat = y_bar.view(y_bar.size(0), -1)
+                               
+                pearson_r_batch = batch_pearsonr(y_hat_flat, y_bar_flat)  # shape: (batch_size,)
+                best_pearson_r = pearson_r_batch.item()  # since batch size = 1      
+                
                 if self.input_mask_slices_1 is not None:
                     best_weights_1 = torch.clone(self.weights_1)
                 
@@ -596,5 +652,11 @@ class Ledidi(torch.nn.Module):
             else:
                 return best_sequence, history
         else:
-            # return best_sequence
-            return best_sequence, last_iter_update
+            if X1 is not None:
+                return best_sequence, best_sequence_1, last_iter_update
+            else:
+                # return best_sequence
+                if last_iter_update == 0:
+                    return best_sequence, int(last_iter_update), float(best_output_loss), int(0), float('nan')
+                else:
+                    return best_sequence, int(last_iter_update), float(best_output_loss), int(num_edits), float(best_pearson_r)
