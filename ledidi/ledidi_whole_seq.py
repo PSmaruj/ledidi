@@ -341,7 +341,10 @@ class Ledidi(torch.nn.Module):
             # prediction for the new sequence
             X_hat = self(X)
             y_hat = self.model(X_hat)
-              
+            
+            # for the movie purposes
+            # torch.save(best_sequence, f"/scratch1/smaruj/genomic_map_transformation/movie/seq_{i}.pt")
+            
             # if self.output_mask_path is not None:
             #     # LOCAL LOSS                
             #     y_hat_unmasked = y_hat[..., loaded_unmask_indices]  

@@ -175,8 +175,10 @@ class Ledidi(torch.nn.Module):
                  output_mask_path=None,
                  use_semifreddo=False,
                  semifreddo_temp_output_path=None,
+                 g=50.0,
                  punish_ctcf=False,
-                 ctcf_meme_path=None):
+                 ctcf_meme_path=None,
+                 suppressing_mask=None):
         super().__init__()
         
         for param in model.parameters():
@@ -205,8 +207,10 @@ class Ledidi(torch.nn.Module):
         self.output_mask_path = output_mask_path
         self.use_semifreddo = use_semifreddo
         self.semifreddo_temp_output_path = semifreddo_temp_output_path
+        self.g = g
         self.punish_ctcf = punish_ctcf
         self.ctcf_meme_path = ctcf_meme_path
+        self.suppressing_mask = suppressing_mask
         
         if (self.punish_ctcf == True) and (self.ctcf_meme_path is None):
             print("Please, provide a path to the CTCF motif in the meme format.")
@@ -240,6 +244,14 @@ class Ledidi(torch.nn.Module):
             print("Weights shape - slice 1:", self.weights_1.shape)
 
         
+    def apply_freeze_mask(self, weights, X, suppressing_mask):
+        with torch.no_grad():
+            for pos in torch.where(suppressing_mask)[0]:
+                orig_nt = torch.argmax(X[0, :, pos]).item()
+                weights[0, :, pos] = -1e4  # suppress all
+                weights[0, orig_nt, pos] = 0.0  # keep original
+    
+        
     def forward(self, X, X1=None, padding_bins=2):
         """Generate a set of edits given a sequence.
 
@@ -267,10 +279,16 @@ class Ledidi(torch.nn.Module):
         if self.use_semifreddo:
             padding_bp = padding_bins * self.bin_size
             # slice 0
+            
+            if self.suppressing_mask is not None:
+                self.apply_freeze_mask(self.weights_0, X[:, :, padding_bp:-padding_bp], self.suppressing_mask)       
+            
             logits = torch.log(X[:, :, padding_bp:-padding_bp] + self.eps) + self.weights_0
+            
             # slice 1
             if X1 is not None:
                 logits_1 = torch.log(X1[:, :, padding_bp:-padding_bp] + self.eps) + self.weights_1
+            
         else:
             start_slice = (min(self.input_mask_slices_0) + self.cropping_applied) * self.bin_size
             end_slice = (max(self.input_mask_slices_0) + 1 + self.cropping_applied) * self.bin_size
@@ -283,15 +301,12 @@ class Ledidi(torch.nn.Module):
                 
                 logits_1 = torch.log(X[:, :, start_slice_1:end_slice_1] + self.eps) + self.weights_1
         
-        # if we want to edit the entire seq
-        # logits = torch.log(X + self.eps) + self.weights_0
-        
         # Expand X to create batch_size copies
         X_expanded = X.expand(self.batch_size, *X.shape[1:])
         
         logits = logits.expand(self.batch_size, -1, -1)
         edited_slice = torch.nn.functional.gumbel_softmax(logits, tau=self.tau, hard=True, dim=1)
-
+        
         # Create a batch of modified sequences
         X_hat = X_expanded.clone()
         
@@ -430,6 +445,8 @@ class Ledidi(torch.nn.Module):
         best_output_loss = output_loss
         best_total_loss = output_loss
         best_sequence = X
+        if X1 is not None:
+            best_sequence_1 = X1
         best_weights_0 = torch.clone(self.weights_0)
         last_iter_update = 0
         
@@ -455,7 +472,7 @@ class Ledidi(torch.nn.Module):
                 "total_loss={:4.4}\ttime=0.0").format(output_loss, 
                     best_total_loss))
         
-        for i in range(1, self.max_iter+1):
+        for i in range(1, self.max_iter+1):  
             # generating new sequence -> FORWARD PASS
             
             # prediction for the new sequence
@@ -536,13 +553,10 @@ class Ledidi(torch.nn.Module):
                     
                     score = max(X_hat_hits[0]["score"].sum(), X1_hat_hits[0]["score"].sum())
                 else:
-                    # score = X_hat_hits[0]["score"].sum()
-                    score = X_hat_hits[0]["score"].max()
+                    score = X_hat_hits[0]["score"].sum()
                     
             if self.punish_ctcf:
-                gamma = 650
-                # gamma=50
-                total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss + score * gamma
+                total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss + score * self.g
             else:
                 total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss
             
@@ -559,6 +573,17 @@ class Ledidi(torch.nn.Module):
             
             if self.input_mask_slices_1 is not None:
                 optimizer_1.step()
+            
+            if self.suppressing_mask is not None:
+                padding_bp = 4096
+                self.apply_freeze_mask(self.weights_0, X[:, :, padding_bp:-padding_bp], self.suppressing_mask)
+            
+            with torch.no_grad():
+                for pos in torch.where(self.suppressing_mask)[0]:
+                    logits = self.weights_0[0, :, pos]
+                    orig_nt = torch.argmax(X[:, :, padding_bp:-padding_bp][0, :, pos]).item()
+                    assert torch.isclose(logits[orig_nt], torch.tensor(0.0, device=logits.device)), f"Position {pos} not frozen correctly!"
+                    assert torch.all(logits != logits.max()) or logits[orig_nt] == logits.max(), f"Other nucleotides at {pos} are not suppressed!"
             
             output_loss = output_loss.item()
             input_loss = input_loss.item()
@@ -604,7 +629,7 @@ class Ledidi(torch.nn.Module):
 
                 best_sequence = torch.clone(X_hat)
                 best_weights_0 = torch.clone(self.weights_0)
-
+                
                 # calculating number of edits
                 orig_nt = torch.argmax(X, dim=1)          # shape: (batch_size, seq_len)
                 best_nt = torch.argmax(X_hat, dim=1)      # shape: (batch_size, seq_len)
@@ -635,10 +660,10 @@ class Ledidi(torch.nn.Module):
 
         optimizer.zero_grad()
         self.weights_0 = torch.nn.Parameter(best_weights_0)
-
-        if self.input_mask_slices_1 is not None:
-            optimizer_1.zero_grad()
-            self.weights_1 = torch.nn.Parameter(best_weights_1)
+        
+        if self.suppressing_mask is not None:
+            padding_bp = 4096
+            self.apply_freeze_mask(self.weights_0, X[:, :, padding_bp:-padding_bp], self.suppressing_mask)
         
         if self.verbose:
             print(("iter=F\tinput_loss={:4.4}\toutput_loss={:4.4}\t" +
@@ -653,7 +678,7 @@ class Ledidi(torch.nn.Module):
                 return best_sequence, history
         else:
             if X1 is not None:
-                return best_sequence, best_sequence_1, last_iter_update
+                return best_sequence, best_sequence_1, int(last_iter_update)
             else:
                 # return best_sequence
                 if last_iter_update == 0:
