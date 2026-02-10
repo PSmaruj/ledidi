@@ -5,14 +5,17 @@
 import time
 import torch
 
+import os
 import sys
 import numpy as np
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 # from semifreddo_full_model import Semifreddo
 from semifreddo_full_v2_model import Semifreddo
-from ledidi.gc_calculation import gc_content
-from ledidi.pwm_score import read_meme_pwm_as_numpy
-from memelite import fimo
+# from ledidi.gc_calculation import gc_content
+# from ledidi.pwm_score import read_meme_pwm_as_numpy
+# from tangermeme.tools import fimo
 
 
 def batch_pearsonr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -154,7 +157,7 @@ class Ledidi(torch.nn.Module):
     """
 
     def __init__(self, 
-                 model, 
+                 models_list, 
                  input_loss=torch.nn.L1Loss(reduction='sum'), 
                  output_loss=torch.nn.MSELoss(), 
                  tau=1, 
@@ -174,18 +177,35 @@ class Ledidi(torch.nn.Module):
                  cropping_applied=32,
                  output_mask_path=None,
                  use_semifreddo=False,
-                 semifreddo_temp_output_path=None,
+                 semifreddo_temp_output_path_list=None,
                  g=50.0,
                  punish_ctcf=False,
                  ctcf_meme_path=None,
                  suppressing_mask=None):
         super().__init__()
         
-        for param in model.parameters():
+        self.models_list = models_list
+        
+        # for 4 models for now
+        model0, model1, model2, model3 = models_list
+        
+        for param in model0.parameters():
+            param.requires_grad = False
+            
+        for param in model1.parameters():
+            param.requires_grad = False
+            
+        for param in model2.parameters():
+            param.requires_grad = False
+            
+        for param in model3.parameters():
             param.requires_grad = False
         
         # model in eval mode
-        self.model = model.eval()
+        model0 = model0.eval()
+        model1 = model1.eval()
+        model2 = model2.eval()
+        model3 = model3.eval()
         
         self.input_loss = input_loss
         self.output_loss = output_loss
@@ -206,7 +226,7 @@ class Ledidi(torch.nn.Module):
         self.cropping_applied = cropping_applied
         self.output_mask_path = output_mask_path
         self.use_semifreddo = use_semifreddo
-        self.semifreddo_temp_output_path = semifreddo_temp_output_path
+        self.semifreddo_temp_output_path_list = semifreddo_temp_output_path_list
         self.g = g
         self.punish_ctcf = punish_ctcf
         self.ctcf_meme_path = ctcf_meme_path
@@ -215,10 +235,10 @@ class Ledidi(torch.nn.Module):
         if (self.punish_ctcf == True) and (self.ctcf_meme_path is None):
             print("Please, provide a path to the CTCF motif in the meme format.")
         
-        if self.ctcf_meme_path is not None:
-            self.ctcf_pwm = read_meme_pwm_as_numpy(self.ctcf_meme_path)
-        else:
-            self.ctcf_pwm = None
+        # if self.ctcf_meme_path is not None:
+        #     self.ctcf_pwm = read_meme_pwm_as_numpy(self.ctcf_meme_path)
+        # else:
+        #     self.ctcf_pwm = None
         
         self.slice_0_length = len(self.input_mask_slices_0) * self.bin_size
         
@@ -234,7 +254,10 @@ class Ledidi(torch.nn.Module):
                 torch.zeros((1, self.num_channels, self.slice_1_length), dtype=torch.float32, requires_grad=True)
             )
         
-        print("Model in train mode:", self.model.training)
+        print("Model 0 in train mode:", model0.training)
+        print("Model 1 in train mode:", model1.training)
+        print("Model 2 in train mode:", model2.training)
+        print("Model 3 in train mode:", model3.training)
         
         print("Gradients enabled for weights - slice 0:", self.weights_0.requires_grad)
         print("Weights shape - slice 0:", self.weights_0.shape)
@@ -340,7 +363,7 @@ class Ledidi(torch.nn.Module):
             return X_hat
         
 
-    def fit_transform(self, X, y_bar, X1=None):
+    def fit_transform(self, X, y_bar_list, X1=None):
         """Apply the Ledidi procedure to design edits for a sequence.
 
         This procedure takes in a single sequence and a desired output from
@@ -371,6 +394,10 @@ class Ledidi(torch.nn.Module):
             passed in.
         """
         
+        model0, model1, model2, model3 = self.models_list
+        
+        y_bar0, y_bar1, y_bar2, y_bar3 = y_bar_list
+        
         optimizer = torch.optim.AdamW((self.weights_0,), lr=self.lr)
         
         if self.input_mask_slices_1 is not None:
@@ -397,15 +424,48 @@ class Ledidi(torch.nn.Module):
         
         # prediction for the input sequence
         if self.use_semifreddo:
-            semifreddo_model = Semifreddo(model=self.model,
+            semifreddo_model0 = Semifreddo(model=model0,
                                           slice_0_padded_seq=X, 
                                           edited_indices_slice_0=self.input_mask_slices_0,
-                                          saved_temp_output_path=self.semifreddo_temp_output_path,
+                                          saved_temp_output_path=self.semifreddo_temp_output_path_list[0],
                                           slice_1_padded_seq=X1,
                                           edited_indices_slice_1=self.input_mask_slices_1,
                                           batch_size=1,
                                           cropping_applied=self.cropping_applied)
-            y_hat = semifreddo_model.forward()
+            y_hat0 = semifreddo_model0.forward()
+            
+            semifreddo_model1 = Semifreddo(model=model1,
+                                          slice_0_padded_seq=X, 
+                                          edited_indices_slice_0=self.input_mask_slices_0,
+                                          saved_temp_output_path=self.semifreddo_temp_output_path_list[1],
+                                          slice_1_padded_seq=X1,
+                                          edited_indices_slice_1=self.input_mask_slices_1,
+                                          batch_size=1,
+                                          cropping_applied=self.cropping_applied)
+            y_hat1 = semifreddo_model1.forward()
+            
+            semifreddo_model2 = Semifreddo(model2,
+                                          slice_0_padded_seq=X, 
+                                          edited_indices_slice_0=self.input_mask_slices_0,
+                                          saved_temp_output_path=self.semifreddo_temp_output_path_list[2],
+                                          slice_1_padded_seq=X1,
+                                          edited_indices_slice_1=self.input_mask_slices_1,
+                                          batch_size=1,
+                                          cropping_applied=self.cropping_applied)
+            y_hat2 = semifreddo_model2.forward()
+            
+            semifreddo_model3 = Semifreddo(model3,
+                                          slice_0_padded_seq=X, 
+                                          edited_indices_slice_0=self.input_mask_slices_0,
+                                          saved_temp_output_path=self.semifreddo_temp_output_path_list[3],
+                                          slice_1_padded_seq=X1,
+                                          edited_indices_slice_1=self.input_mask_slices_1,
+                                          batch_size=1,
+                                          cropping_applied=self.cropping_applied)
+            y_hat3 = semifreddo_model3.forward()
+            
+            # y_hat = torch.stack([y_hat0, y_hat1, y_hat2, y_hat3], dim=0).mean(dim=0)
+            
         else:
             y_hat = self.model(X)
         # y_hat = y_hat.squeeze(1)
@@ -413,8 +473,15 @@ class Ledidi(torch.nn.Module):
         n_iter_wo_improvement = 0
         
         # forcing all variables to float32    
-        y_hat = y_hat.float()
-        y_bar = y_bar.float()
+        y_hat0 = y_hat0.float()
+        y_hat1 = y_hat1.float()
+        y_hat2 = y_hat2.float()
+        y_hat3 = y_hat3.float()
+        
+        y_bar0 = y_bar0.float()
+        y_bar1 = y_bar1.float()
+        y_bar2 = y_bar2.float()
+        y_bar3 = y_bar3.float()
         
         # loss between the prediction of the original sequence
         # and the desired prediction (aka starting loss)  
@@ -422,20 +489,32 @@ class Ledidi(torch.nn.Module):
             # LOCAL LOSS
             print("Local loss applied.")
             loaded_unmask_indices = torch.load(self.output_mask_path, weights_only=True)
-            loaded_unmask_indices = loaded_unmask_indices.to(dtype=torch.long, device=y_hat.device)
+            loaded_unmask_indices = loaded_unmask_indices.to(dtype=torch.long, device=y_hat0.device)
             
-            y_hat_unmasked = y_hat[..., loaded_unmask_indices]
-            y_bar_unmasked = y_bar[..., loaded_unmask_indices]
+            y_hat0_unmasked = y_hat0[..., loaded_unmask_indices]
+            y_hat1_unmasked = y_hat1[..., loaded_unmask_indices]
+            y_hat2_unmasked = y_hat2[..., loaded_unmask_indices]
+            y_hat3_unmasked = y_hat3[..., loaded_unmask_indices]
             
-            scaling_factor = y_hat.shape[-1] // y_hat_unmasked.shape[-1]
+            y_bar0_unmasked = y_bar0[..., loaded_unmask_indices]
+            y_bar1_unmasked = y_bar1[..., loaded_unmask_indices]
+            y_bar2_unmasked = y_bar2[..., loaded_unmask_indices]
+            y_bar3_unmasked = y_bar3[..., loaded_unmask_indices]
             
-            output_loss = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
+            scaling_factor = y_hat0.shape[-1] // y_hat0_unmasked.shape[-1]
             
-            # mixed loss = global loss + scaled local loss
-            # output_loss_everywhere = self.output_loss(y_hat, y_bar)
-            # local_loss_scaled = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
-            # output_loss = output_loss_everywhere + local_loss_scaled
-        
+            y_hat0_unmasked = y_hat0_unmasked.to(device=y_bar0_unmasked.device)
+            y_hat1_unmasked = y_hat1_unmasked.to(device=y_bar1_unmasked.device)
+            y_hat2_unmasked = y_hat2_unmasked.to(device=y_bar2_unmasked.device)
+            y_hat3_unmasked = y_hat3_unmasked.to(device=y_bar3_unmasked.device)
+            
+            loss0 = self.output_loss(y_hat0_unmasked, y_bar0_unmasked)
+            loss1 = self.output_loss(y_hat1_unmasked, y_bar1_unmasked)
+            loss2 = self.output_loss(y_hat2_unmasked, y_bar2_unmasked)
+            loss3 = self.output_loss(y_hat3_unmasked, y_bar3_unmasked)
+
+            output_loss = torch.stack([loss0, loss1, loss2, loss3]).max() * scaling_factor
+            
         else:
             # GLOBAL LOSS
             print("Global loss applied.")
@@ -460,10 +539,15 @@ class Ledidi(torch.nn.Module):
             X_1 = X1.repeat(self.batch_size, 1, 1)
         
         # Ensure y_bar has shape (batch_size, num_targets, vector_len)
-        if y_bar.dim() == 2:
-            y_bar = y_bar.unsqueeze(1)
+        # if y_bar.dim() == 2:
+        #     y_bar = y_bar.unsqueeze(1)
                 
-        y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
+        # y_bar = y_bar.expand(self.batch_size, *y_bar.shape[1:])
+        
+        y_bar0 = y_bar0.expand(self.batch_size, *y_bar0.shape[1:])
+        y_bar1 = y_bar1.expand(self.batch_size, *y_bar1.shape[1:])
+        y_bar2 = y_bar2.expand(self.batch_size, *y_bar2.shape[1:])
+        y_bar3 = y_bar3.expand(self.batch_size, *y_bar3.shape[1:])
         
         tic = time.time()
         initial_tic = time.time()
@@ -482,15 +566,47 @@ class Ledidi(torch.nn.Module):
                 
                     X_hat = self(X)
                                         
-                    semifreddo_model = Semifreddo(model=self.model,
-                                    slice_0_padded_seq=X_hat, 
-                                    edited_indices_slice_0=self.input_mask_slices_0,
-                                    saved_temp_output_path=self.semifreddo_temp_output_path,
-                                    slice_1_padded_seq=None,
-                                    edited_indices_slice_1=self.input_mask_slices_1,
-                                    batch_size=self.batch_size,
-                                    cropping_applied=self.cropping_applied)
-                    y_hat = semifreddo_model.forward()
+                    semifreddo_model0 = Semifreddo(model=model0,
+                                                slice_0_padded_seq=X_hat, 
+                                                edited_indices_slice_0=self.input_mask_slices_0,
+                                                saved_temp_output_path=self.semifreddo_temp_output_path_list[0],
+                                                slice_1_padded_seq=X1,
+                                                edited_indices_slice_1=self.input_mask_slices_1,
+                                                batch_size=1,
+                                                cropping_applied=self.cropping_applied)
+                    y_hat0 = semifreddo_model0.forward()
+            
+                    semifreddo_model1 = Semifreddo(model=model1,
+                                                slice_0_padded_seq=X_hat, 
+                                                edited_indices_slice_0=self.input_mask_slices_0,
+                                                saved_temp_output_path=self.semifreddo_temp_output_path_list[1],
+                                                slice_1_padded_seq=X1,
+                                                edited_indices_slice_1=self.input_mask_slices_1,
+                                                batch_size=1,
+                                                cropping_applied=self.cropping_applied)
+                    y_hat1 = semifreddo_model1.forward()
+                    
+                    semifreddo_model2 = Semifreddo(model2,
+                                                slice_0_padded_seq=X_hat, 
+                                                edited_indices_slice_0=self.input_mask_slices_0,
+                                                saved_temp_output_path=self.semifreddo_temp_output_path_list[2],
+                                                slice_1_padded_seq=X1,
+                                                edited_indices_slice_1=self.input_mask_slices_1,
+                                                batch_size=1,
+                                                cropping_applied=self.cropping_applied)
+                    y_hat2 = semifreddo_model2.forward()
+            
+                    semifreddo_model3 = Semifreddo(model3,
+                                                slice_0_padded_seq=X_hat, 
+                                                edited_indices_slice_0=self.input_mask_slices_0,
+                                                saved_temp_output_path=self.semifreddo_temp_output_path_list[3],
+                                                slice_1_padded_seq=X1,
+                                                edited_indices_slice_1=self.input_mask_slices_1,
+                                                batch_size=1,
+                                                cropping_applied=self.cropping_applied)
+                    y_hat3 = semifreddo_model3.forward()
+            
+                    # y_hat = torch.stack([y_hat0, y_hat1, y_hat2, y_hat3], dim=0).mean(dim=0)
                 
                 else:
                     X_hat, X1_hat = self(X, X1)
@@ -510,8 +626,15 @@ class Ledidi(torch.nn.Module):
                 y_hat = self.model(X_hat)
             
             # forcing all variables to float32    
-            y_hat = y_hat.float()
-            y_bar = y_bar.float()
+            y_hat0 = y_hat0.float()
+            y_hat1 = y_hat1.float()
+            y_hat2 = y_hat2.float()
+            y_hat3 = y_hat3.float()
+            
+            y_bar0 = y_bar0.float()
+            y_bar1 = y_bar1.float()
+            y_bar2 = y_bar2.float()
+            y_bar3 = y_bar3.float()
             
             X = X.float()
             X_hat = X_hat.float()
@@ -526,9 +649,31 @@ class Ledidi(torch.nn.Module):
               
             if self.output_mask_path is not None:
                 # LOCAL LOSS                
-                y_hat_unmasked = y_hat[..., loaded_unmask_indices]  
-                y_bar_unmasked = y_bar[..., loaded_unmask_indices]              
-                output_loss = self.output_loss(y_hat_unmasked, y_bar_unmasked) * scaling_factor
+                
+                y_hat0_unmasked = y_hat0[..., loaded_unmask_indices]
+                y_hat1_unmasked = y_hat1[..., loaded_unmask_indices]
+                y_hat2_unmasked = y_hat2[..., loaded_unmask_indices]
+                y_hat3_unmasked = y_hat3[..., loaded_unmask_indices]
+                
+                y_bar0_unmasked = y_bar0[..., loaded_unmask_indices]
+                y_bar1_unmasked = y_bar1[..., loaded_unmask_indices]
+                y_bar2_unmasked = y_bar2[..., loaded_unmask_indices]
+                y_bar3_unmasked = y_bar3[..., loaded_unmask_indices]
+                
+                scaling_factor = y_hat0.shape[-1] // y_hat0_unmasked.shape[-1]
+                
+                y_hat0_unmasked = y_hat0_unmasked.to(device=y_bar0_unmasked.device)
+                y_hat1_unmasked = y_hat1_unmasked.to(device=y_bar1_unmasked.device)
+                y_hat2_unmasked = y_hat2_unmasked.to(device=y_bar2_unmasked.device)
+                y_hat3_unmasked = y_hat3_unmasked.to(device=y_bar3_unmasked.device)
+                
+                loss0 = self.output_loss(y_hat0_unmasked, y_bar0_unmasked)
+                loss1 = self.output_loss(y_hat1_unmasked, y_bar1_unmasked)
+                loss2 = self.output_loss(y_hat2_unmasked, y_bar2_unmasked)
+                loss3 = self.output_loss(y_hat3_unmasked, y_bar3_unmasked)
+
+                output_loss = torch.stack([loss0, loss1, loss2, loss3]).max() * scaling_factor
+                
             else:
                 # GLOBAL LOSS
                 output_loss = self.output_loss(y_hat, y_bar)
@@ -544,16 +689,16 @@ class Ledidi(torch.nn.Module):
                 X_hat_slice_bin = X_hat[:,:,4076:-4076]
                 X_hat_slice_bin_cpu = X_hat_slice_bin.cpu().detach().numpy()
                 # fimo score hits
-                X_hat_hits = fimo(motifs=motifs_dict, sequences=X_hat_slice_bin_cpu, threshold=1e-4, reverse_complement=True)
+                # X_hat_hits = fimo.fimo(motifs=motifs_dict, sequences=X_hat_slice_bin_cpu, threshold=1e-4, reverse_complement=True)
                 
-                if X1 is not None:
-                    X1_hat_slice_bin = X1_hat[:,:,4076:-4076]
-                    X1_hat_slice_bin_cpu = X1_hat_slice_bin.cpu().detach().numpy()
-                    X1_hat_hits = fimo(motifs=motifs_dict, sequences=X1_hat_slice_bin_cpu, threshold=1e-4, reverse_complement=True)
+                # if X1 is not None:
+                #     X1_hat_slice_bin = X1_hat[:,:,4076:-4076]
+                #     X1_hat_slice_bin_cpu = X1_hat_slice_bin.cpu().detach().numpy()
+                    # X1_hat_hits = fimo.fimo(motifs=motifs_dict, sequences=X1_hat_slice_bin_cpu, threshold=1e-4, reverse_complement=True)
                     
-                    score = max(X_hat_hits[0]["score"].sum(), X1_hat_hits[0]["score"].sum())
-                else:
-                    score = X_hat_hits[0]["score"].sum()
+                    # score = max(X_hat_hits[0]["score"].sum(), X1_hat_hits[0]["score"].sum())
+                # else:
+                    # score = X_hat_hits[0]["score"].sum()
                     
             if self.punish_ctcf:
                 total_loss = output_loss + torch.tensor(self.l, dtype=torch.float32) * input_loss + score * self.g
@@ -567,7 +712,7 @@ class Ledidi(torch.nn.Module):
             if self.input_mask_slices_1 is not None:
                 optimizer_1.zero_grad()
             
-            total_loss.backward()                                    
+            total_loss.backward(retain_graph=True)                                    
             
             optimizer.step()
             
@@ -578,12 +723,12 @@ class Ledidi(torch.nn.Module):
                 padding_bp = 4096
                 self.apply_freeze_mask(self.weights_0, X[:, :, padding_bp:-padding_bp], self.suppressing_mask)
             
-                # with torch.no_grad():
-                #     for pos in torch.where(self.suppressing_mask)[0]:
-                #         logits = self.weights_0[0, :, pos]
-                #         orig_nt = torch.argmax(X[:, :, padding_bp:-padding_bp][0, :, pos]).item()
-                #         assert torch.isclose(logits[orig_nt], torch.tensor(0.0, device=logits.device)), f"Position {pos} not frozen correctly!"
-                #         assert torch.all(logits != logits.max()) or logits[orig_nt] == logits.max(), f"Other nucleotides at {pos} are not suppressed!"
+                with torch.no_grad():
+                    for pos in torch.where(self.suppressing_mask)[0]:
+                        logits = self.weights_0[0, :, pos]
+                        orig_nt = torch.argmax(X[:, :, padding_bp:-padding_bp][0, :, pos]).item()
+                        assert torch.isclose(logits[orig_nt], torch.tensor(0.0, device=logits.device)), f"Position {pos} not frozen correctly!"
+                        assert torch.all(logits != logits.max()) or logits[orig_nt] == logits.max(), f"Other nucleotides at {pos} are not suppressed!"
             
             output_loss = output_loss.item()
             input_loss = input_loss.item()
@@ -640,10 +785,13 @@ class Ledidi(torch.nn.Module):
                 
                 # PearsonR between prediction and target 
                 # Flatten from (1, 1, 130305) → (1, 130305)
-                y_hat_flat = y_hat.view(y_hat.size(0), -1)
-                y_bar_flat = y_bar.view(y_bar.size(0), -1)
+                y_hat_ct0_flat = y_hat0.view(y_hat0.size(0), -1)
+                y_bar_ct0_flat = y_bar0.view(y_bar0.size(0), -1)
+                
+                # Ensure both are on the same device
+                y_bar_ct0_flat = y_bar_ct0_flat.to(y_hat_ct0_flat.device)       
                                
-                pearson_r_batch = batch_pearsonr(y_hat_flat, y_bar_flat)  # shape: (batch_size,)
+                pearson_r_batch = batch_pearsonr(y_hat_ct0_flat, y_bar_ct0_flat)  # shape: (batch_size,)
                 best_pearson_r = pearson_r_batch.item()  # since batch size = 1      
                 
                 if self.input_mask_slices_1 is not None:

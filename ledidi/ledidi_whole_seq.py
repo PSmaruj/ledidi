@@ -316,6 +316,9 @@ class Ledidi(torch.nn.Module):
         best_weights = torch.clone(self.weights)
         last_iter_update = 0
         
+        # for the movie purposes
+        torch.save(best_sequence, f"/scratch1/smaruj/genomic_map_transformation/movie/seq_0.pt")
+        
         # X_ is the original sequence expanded to the batch size
         X_ = X.repeat(self.batch_size, 1, 1)
         
@@ -430,6 +433,10 @@ class Ledidi(torch.nn.Module):
                 best_weights = torch.clone(self.weights)
                 
                 n_iter_wo_improvement = 0
+                
+                # for the movie purposes
+                torch.save(best_sequence, f"/scratch1/smaruj/genomic_map_transformation/movie/seq_{i}.pt")
+                
             else:
                 n_iter_wo_improvement += 1
                 if n_iter_wo_improvement == self.early_stopping_iter:
